@@ -135,3 +135,62 @@ class ExportResponse(BaseModel):
     run_id: str
     download_url: str
     format: str
+
+
+class PredictRequest(BaseModel):
+    feature_values: dict
+
+
+class PredictionModelResult(BaseModel):
+    model_id: str
+    prediction: Optional[str] = None
+    class_probabilities: Optional[dict] = None
+    error: Optional[str] = None
+
+
+class PredictResponse(BaseModel):
+    run_id: str
+    predictions: list[PredictionModelResult]
+
+
+class GainsLiftRow(BaseModel):
+    group: int
+    cumulative_data_pct: float
+    lift: float
+    gain_pct: float
+
+
+class GainsLiftResponse(BaseModel):
+    run_id: str
+    rows: list[GainsLiftRow]
+
+
+class BestModelSummary(BaseModel):
+    model_id: str
+    algorithm: str
+    metrics: dict
+    all_metrics: dict
+
+
+class AISummaryResponse(BaseModel):
+    executive_summary: str
+    key_insights: list[str]
+    recommendations: list[str]
+    real_world_example: str
+
+
+class HFDatasetInfo(BaseModel):
+    hf_id: str
+    hf_url: str
+    name: str
+    filename: str
+    task: str
+    rows: int
+    cols: int
+    size_kb: int
+    description: str
+    target_hint: str
+
+
+class HFImportRequest(BaseModel):
+    hf_id: str

@@ -11,8 +11,9 @@ pandas
 numpy
 scikit-learn
 
-# AI Assistant (open-source - Phase 1)
+# AI Assistant & Data (open-source - Phase 1)
 huggingface_hub
+datasets
 
 # AI Assistant (Azure - Phase 2, uncomment when needed)
 # openai

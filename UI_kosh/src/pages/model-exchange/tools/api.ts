@@ -4,6 +4,7 @@ import type {
   AIRecommendResponse, TrainingStartRequest, TrainingStartResponse,
   TrainingStatusResponse, LeaderboardResponse, FeatureImportanceResponse,
   ConfusionMatrixResponse, ResidualsResponse, UseCaseSuggestionsResponse,
+  HFDatasetInfo,
 } from './types';
 
 const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8001';
@@ -91,6 +92,37 @@ export const getResiduals = async (runId: string): Promise<ResidualsResponse> =>
 
 export const getExportUrl = (runId: string, format: string = 'csv') =>
   `${BASE}/team1/results/${runId}/export?format=${format}`;
+
+export const predict = async (runId: string, featureValues: Record<string, unknown>) => {
+  const { data } = await api.post(`/team1/results/${runId}/predict`, { feature_values: featureValues });
+  return data;
+};
+
+export const getRandomRow = async (runId: string) => {
+  const { data } = await api.get(`/team1/results/${runId}/random-row`);
+  return data;
+};
+
+export const getGainsLift = async (runId: string) => {
+  const { data } = await api.get(`/team1/results/${runId}/gains-lift`);
+  return data;
+};
+
+export const generateAISummary = async (runId: string) => {
+  const { data } = await api.post(`/team1/results/${runId}/ai-summary`);
+  return data;
+};
+
+export const browseHFDatasets = async (task?: string): Promise<HFDatasetInfo[]> => {
+  const params = task ? { task } : {};
+  const { data } = await api.get('/team1/datasets/huggingface/browse', { params });
+  return data;
+};
+
+export const importHFDataset = async (hfId: string): Promise<DatasetMetadata> => {
+  const { data } = await api.post('/team1/datasets/huggingface/import', { hf_id: hfId });
+  return data;
+};
 
 export const getWsUrl = (runId: string) => {
   const wsBase = BASE.replace(/^http/, 'ws');

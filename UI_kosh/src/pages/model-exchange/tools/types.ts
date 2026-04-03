@@ -131,6 +131,19 @@ export interface WizardState {
   leaderboard: LeaderboardResponse | null;
 }
 
+export interface HFDatasetInfo {
+  hf_id: string;
+  hf_url: string;
+  name: string;
+  filename: string;
+  task: string;
+  rows: number;
+  cols: number;
+  size_kb: number;
+  description: string;
+  target_hint: string;
+}
+
 export const MODEL_INFO: Record<ModelType, { name: string; speed: string; description: string }> = {
   DRF: { name: 'Distributed Random Forest', speed: 'Medium', description: 'Ensemble of random trees' },
   GLM: { name: 'Generalized Linear Model', speed: 'Fast', description: 'Logistic regression variant' },

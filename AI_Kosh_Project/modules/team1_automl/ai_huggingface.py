@@ -1,6 +1,6 @@
 import logging
 from .config import HUGGINGFACE_TOKEN, HUGGINGFACE_MODEL
-from .schemas import AIRecommendResponse, ColumnInfo
+from .schemas import AIRecommendResponse, AISummaryResponse, ColumnInfo
 
 logger = logging.getLogger(__name__)
 
@@ -103,3 +103,57 @@ async def recommend(columns: list[ColumnInfo], use_case: str) -> AIRecommendResp
     except Exception as e:
         logger.warning(f"HuggingFace API failed, falling back to rule-based: {e}")
         return _rule_based_recommend(columns, use_case)
+
+
+async def generate_results_summary(
+    best_algo: str, best_id: str, target: str, ml_task: str,
+    metrics: dict, num_models: int,
+) -> AISummaryResponse:
+    """Use HF or fallback to generate AI summary of results."""
+    if not HUGGINGFACE_TOKEN:
+        raise Exception("No HF token, use rule-based fallback")
+
+    try:
+        from huggingface_hub import InferenceClient
+        import json
+
+        metrics_str = "\n".join(f"- {k}: {v}" for k, v in metrics.items() if v is not None)
+        client = InferenceClient(model=HUGGINGFACE_MODEL, token=HUGGINGFACE_TOKEN)
+        response = client.chat_completion(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a data science expert. Analyze ML results and provide insights. "
+                        "Respond in this exact JSON format:\n"
+                        '{"executive_summary": "...", "key_insights": ["..."], '
+                        '"recommendations": ["..."], "real_world_example": "..."}'
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Task: {ml_task}\nTarget: {target}\nBest model: {best_id} ({best_algo})\n"
+                        f"Models trained: {num_models}\nMetrics:\n{metrics_str}\n\n"
+                        f"Provide: executive summary, 3-4 key insights, 3-4 recommendations, "
+                        f"and a real-world example. JSON only."
+                    ),
+                },
+            ],
+            max_tokens=800,
+        )
+        text = response.choices[0].message.content.strip()
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            data = json.loads(text[start:end])
+            return AISummaryResponse(
+                executive_summary=data.get("executive_summary", ""),
+                key_insights=data.get("key_insights", []),
+                recommendations=data.get("recommendations", []),
+                real_world_example=data.get("real_world_example", ""),
+            )
+    except Exception as e:
+        logger.warning(f"HF summary failed: {e}")
+
+    raise Exception("HF summary generation failed")

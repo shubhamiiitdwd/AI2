@@ -24,6 +24,9 @@ from .schemas import (
     LeaderboardResponse, ModelResult, FeatureImportanceResponse,
     ConfusionMatrixResponse, ResidualsResponse, ExportResponse, ColumnInfo,
     UseCaseSuggestion, UseCaseSuggestionsResponse,
+    PredictRequest, PredictResponse, PredictionModelResult,
+    GainsLiftResponse, GainsLiftRow,
+    BestModelSummary, AISummaryResponse,
 )
 from .enums import MLTask, TrainingStatus
 from . import data_processor
@@ -259,7 +262,19 @@ async def start_training(req: TrainingStartRequest) -> TrainingStartResponse:
     )
 
 
+KNOWN_ALGOS = ['StackedEnsemble', 'DeepLearning', 'XGBoost', 'GBM', 'GLM', 'DRF', 'XRT']
+
+
+def _extract_algo(mid: str) -> str:
+    for algo in KNOWN_ALGOS:
+        if mid.startswith(algo):
+            return algo
+    return mid.split("_")[0] if "_" in mid else mid
+
+
 async def _run_training(run_id: str):
+    import concurrent.futures
+
     run = _active_runs.get(run_id)
     if not run:
         return
@@ -285,21 +300,12 @@ async def _run_training(run_id: str):
 
         models_list = [m.value for m in req.models] if req.models else None
 
-        def progress_cb(stage, percent, message):
-            asyncio.get_event_loop().call_soon_threadsafe(
-                asyncio.ensure_future,
-                _update_run(run_id, TrainingStatus(stage) if stage in TrainingStatus.__members__.values() else TrainingStatus.TRAINING, percent, message)
-            )
-
-        await _update_run(run_id, TrainingStatus.TRAINING, 30, "Starting AutoML training...")
-
         loop = asyncio.get_event_loop()
         aml = await loop.run_in_executor(
             None,
-            lambda: h2o_engine.run_automl(
+            lambda: h2o_engine.setup_automl(
                 frame=frame,
                 target=req.target_column,
-                features=req.feature_columns,
                 ml_task=req.ml_task.value,
                 include_algos=models_list,
                 max_models=req.max_models,
@@ -308,8 +314,48 @@ async def _run_training(run_id: str):
                 seed=42,
             )
         )
-
         run["aml"] = aml
+
+        await _update_run(run_id, TrainingStatus.TRAINING, 30, "Starting AutoML training...")
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            h2o_engine.train_automl, aml, req.feature_columns, req.target_column, frame
+        )
+
+        while not future.done():
+            await asyncio.sleep(2)
+
+        future.result()
+        executor.shutdown(wait=False)
+
+        lb_snapshot = h2o_engine.poll_leaderboard(aml)
+        if lb_snapshot:
+            metric_cols = [k for k in lb_snapshot[0] if k != "model_id"]
+            primary_metric = metric_cols[0] if metric_cols else None
+            best_val = None
+            last_leader = None
+
+            for i, row in enumerate(lb_snapshot):
+                model_id = row.get("model_id", "")
+                progress = min(30 + (i + 1) * 3, 80)
+                await _update_run(
+                    run_id, TrainingStatus.TRAINING, progress,
+                    f"AutoML: starting {model_id} model training"
+                )
+
+                if primary_metric:
+                    val = row.get(primary_metric)
+                    if val is not None:
+                        if best_val is None or val <= best_val:
+                            best_val = val
+                            if model_id != last_leader:
+                                last_leader = model_id
+                                await _update_run(
+                                    run_id, TrainingStatus.TRAINING, progress,
+                                    f"New leader: {model_id}, {primary_metric}: {val}"
+                                )
+
         await _update_run(run_id, TrainingStatus.EVALUATION, 85, "Evaluating models...")
 
         lb = h2o_engine.get_leaderboard(aml)
@@ -319,14 +365,6 @@ async def _run_training(run_id: str):
         model_save_dir = str(MODELS_DIR / run_id)
         Path(model_save_dir).mkdir(parents=True, exist_ok=True)
         saved_path = h2o_engine.save_model(best, model_save_dir)
-
-        KNOWN_ALGOS = ['StackedEnsemble', 'DeepLearning', 'XGBoost', 'GBM', 'GLM', 'DRF', 'XRT']
-
-        def _extract_algo(mid: str) -> str:
-            for algo in KNOWN_ALGOS:
-                if mid.startswith(algo):
-                    return algo
-            return mid.split("_")[0] if "_" in mid else mid
 
         models_result = []
         for i, row in enumerate(lb):
@@ -427,13 +465,23 @@ async def training_websocket(websocket: WebSocket, run_id: str):
             except asyncio.TimeoutError:
                 run = _active_runs.get(run_id)
                 if run and run["status"] in (TrainingStatus.COMPLETE, TrainingStatus.FAILED, TrainingStatus.STOPPED):
-                    await websocket.send_json({"status": run["status"].value, "progress": run["progress"], "message": "done"})
+                    await websocket.send_json({
+                        "status": run["status"].value,
+                        "progress": run["progress"],
+                        "stage": run["stage"],
+                        "message": "done",
+                        "timestamp": datetime.now().isoformat(),
+                    })
                     break
             except WebSocketDisconnect:
                 break
     finally:
         if run_id in _websocket_connections:
             _websocket_connections[run_id] = [ws for ws in _websocket_connections[run_id] if ws != websocket]
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 # ── Results ────────────────────────────────────────────────────────────────
@@ -455,16 +503,49 @@ async def get_leaderboard(run_id: str) -> LeaderboardResponse:
 
 
 async def get_best_model(run_id: str):
+    import math
+
     run = _active_runs.get(run_id)
     if not run or not run.get("result"):
         raise HTTPException(404, "Results not found")
 
     result = run["result"]
     best = next((m for m in result["leaderboard"] if m.is_best), None)
+
+    all_metrics = {}
+    aml = run.get("aml")
+    frame = run.get("frame")
+    if aml and frame:
+        try:
+            best_model = h2o_engine.get_best_model(aml)
+            all_metrics = h2o_engine.get_model_metrics(best_model, frame, result["ml_task"])
+        except Exception:
+            pass
+
+    if not all_metrics and best:
+        all_metrics = {k: v for k, v in best.metrics.items() if k != "model_id"}
+
+    cleaned_metrics = {}
+    for k, v in all_metrics.items():
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+            if math.isnan(fv) or math.isinf(fv):
+                continue
+            cleaned_metrics[k] = round(fv, 6)
+        except (ValueError, TypeError):
+            continue
+
+    req = run["request"]
     return {
         "run_id": run_id,
         "best_model": best.model_dump() if best else None,
+        "all_metrics": cleaned_metrics,
         "feature_importance": result["feature_importance"][:10],
+        "ml_task": result["ml_task"],
+        "target_column": req.target_column,
+        "feature_columns": req.feature_columns,
     }
 
 
@@ -538,6 +619,8 @@ async def export_results(run_id: str, format: str = "csv"):
     export_dir.mkdir(parents=True, exist_ok=True)
 
     if format == "json":
+        import math
+
         export_path = export_dir / "results.json"
         data = {
             "run_id": run_id,
@@ -545,7 +628,13 @@ async def export_results(run_id: str, format: str = "csv"):
             "leaderboard": [m.model_dump() for m in result["leaderboard"]],
             "feature_importance": result["feature_importance"][:15],
         }
-        export_path.write_text(json.dumps(data, indent=2, default=str))
+
+        def _json_default(obj):
+            if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+                return None
+            return str(obj)
+
+        export_path.write_text(json.dumps(data, indent=2, default=_json_default))
     else:
         import pandas as pd
         export_path = export_dir / "results.csv"
@@ -560,4 +649,201 @@ async def export_results(run_id: str, format: str = "csv"):
         path=str(export_path),
         filename=f"automl_results_{run_id}.{format}",
         media_type="application/octet-stream",
+    )
+
+
+# ── Predict ───────────────────────────────────────────────────────────────
+
+async def predict(run_id: str, req: PredictRequest) -> PredictResponse:
+    run = _active_runs.get(run_id)
+    if not run or not run.get("result"):
+        raise HTTPException(404, "Results not found")
+
+    aml = run.get("aml")
+    frame = run.get("frame")
+    if not aml:
+        raise HTTPException(400, "Models not available in memory")
+
+    ml_task = run["result"]["ml_task"]
+
+    loop = asyncio.get_event_loop()
+    predictions = await loop.run_in_executor(
+        None, lambda: h2o_engine.predict_all_models(aml, req.feature_values, ml_task, frame)
+    )
+
+    results = []
+    for p in predictions:
+        results.append(PredictionModelResult(
+            model_id=p["model_id"],
+            prediction=str(p.get("prediction", "")),
+            class_probabilities=p.get("class_probabilities"),
+            error=p.get("error"),
+        ))
+    return PredictResponse(run_id=run_id, predictions=results)
+
+
+async def get_random_row(run_id: str) -> dict:
+    run = _active_runs.get(run_id)
+    if not run or not run.get("result"):
+        raise HTTPException(404, "Results not found")
+
+    frame = run.get("frame")
+    req = run["request"]
+    if not frame:
+        raise HTTPException(400, "Data frame not in memory")
+
+    loop = asyncio.get_event_loop()
+    row = await loop.run_in_executor(
+        None, lambda: h2o_engine.get_random_row(frame, req.target_column, req.feature_columns)
+    )
+    return {"feature_values": row}
+
+
+async def get_gains_lift(run_id: str) -> GainsLiftResponse:
+    run = _active_runs.get(run_id)
+    if not run or not run.get("result"):
+        raise HTTPException(404, "Results not found")
+    if run["result"]["ml_task"] != "classification":
+        return GainsLiftResponse(run_id=run_id, rows=[])
+
+    aml = run.get("aml")
+    frame = run.get("frame")
+    if not aml or not frame:
+        return GainsLiftResponse(run_id=run_id, rows=[])
+
+    best = h2o_engine.get_best_model(aml)
+    loop = asyncio.get_event_loop()
+    rows_data = await loop.run_in_executor(None, lambda: h2o_engine.get_gains_lift(best, frame))
+    rows = [GainsLiftRow(**r) for r in rows_data]
+    return GainsLiftResponse(run_id=run_id, rows=rows)
+
+
+async def generate_ai_summary(run_id: str) -> AISummaryResponse:
+    import math
+
+    run = _active_runs.get(run_id)
+    if not run or not run.get("result"):
+        raise HTTPException(404, "Results not found")
+
+    result = run["result"]
+    req = run["request"]
+    best = next((m for m in result["leaderboard"] if m.is_best), None)
+    ml_task = result["ml_task"]
+
+    all_metrics = {}
+    aml = run.get("aml")
+    frame = run.get("frame")
+    if aml and frame:
+        try:
+            best_model = h2o_engine.get_best_model(aml)
+            raw_metrics = h2o_engine.get_model_metrics(best_model, frame, ml_task)
+            for k, v in raw_metrics.items():
+                if v is not None:
+                    try:
+                        fv = float(v)
+                        if not (math.isnan(fv) or math.isinf(fv)):
+                            all_metrics[k] = fv
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            pass
+
+    if not all_metrics and best:
+        for k, v in best.metrics.items():
+            if k != "model_id" and v is not None:
+                try:
+                    fv = float(v)
+                    if not (math.isnan(fv) or math.isinf(fv)):
+                        all_metrics[k] = fv
+                except (ValueError, TypeError):
+                    pass
+
+    best_algo = best.algorithm if best else "Unknown"
+    best_id = best.model_id if best else "Unknown"
+    target = req.target_column
+    num_models = len(result["leaderboard"])
+    metrics_str = ", ".join(f"{k}: {v}" for k, v in (all_metrics or {}).items() if v is not None)
+
+    ai = ai_service.get_ai_service()
+    try:
+        summary = await ai.generate_results_summary(
+            best_algo=best_algo,
+            best_id=best_id,
+            target=target,
+            ml_task=ml_task,
+            metrics=all_metrics,
+            num_models=num_models,
+        )
+        return summary
+    except Exception as e:
+        logger.warning(f"AI summary generation failed: {e}")
+        return _rule_based_summary(best_algo, best_id, target, ml_task, all_metrics, num_models)
+
+
+def _rule_based_summary(best_algo, best_id, target, ml_task, metrics, num_models):
+    import math
+
+    def _safe(v):
+        if v is None:
+            return None
+        try:
+            fv = float(v)
+            return None if (math.isnan(fv) or math.isinf(fv)) else fv
+        except (ValueError, TypeError):
+            return None
+
+    auc = _safe(metrics.get("auc"))
+    acc = _safe(metrics.get("accuracy"))
+    rmse = _safe(metrics.get("rmse"))
+    r2 = _safe(metrics.get("r2"))
+
+    if ml_task == "classification":
+        perf_desc = f"an AUC of {auc:.4f}" if auc else "the best available metrics"
+        acc_desc = f"and an accuracy of {acc*100:.1f}%" if acc else ""
+        exec_summary = (
+            f"The H2O AutoML results indicate that the best-performing model for the "
+            f"{ml_task} task of predicting '{target}' is {best_id}, "
+            f"achieving {perf_desc} {acc_desc}."
+        )
+    else:
+        perf_desc = f"an RMSE of {rmse:.4f}" if rmse else "the best available metrics"
+        r2_desc = f"and R² of {r2:.4f}" if r2 else ""
+        exec_summary = (
+            f"The H2O AutoML results indicate that the best-performing model for the "
+            f"{ml_task} task of predicting '{target}' is {best_id}, "
+            f"achieving {perf_desc} {r2_desc}."
+        )
+
+    insights = [
+        f"The best model, {best_id}, achieved the highest performance among {num_models} trained models.",
+    ]
+    if ml_task == "classification":
+        if acc and acc < 0.75:
+            insights.append(f"The accuracy of {acc*100:.1f}% is reasonable but suggests potential for further optimization.")
+        elif acc and acc >= 0.75:
+            insights.append(f"The accuracy of {acc*100:.1f}% indicates strong predictive performance.")
+        if auc and auc < 0.7:
+            insights.append(f"The AUC of {auc:.4f} suggests moderate discriminatory power with room for improvement.")
+    else:
+        if r2 is not None:
+            insights.append(f"The R² score of {r2:.4f} explains {r2*100:.1f}% of variance in the target variable.")
+
+    recommendations = [
+        f"Focus on improving model performance by addressing potential class imbalance or feature engineering.",
+        f"Investigate the features contributing most to predictions and consider feature engineering.",
+        f"Experiment with hyperparameter tuning for the {best_algo} model to further optimize performance.",
+        f"Consider collecting more data or enriching the dataset with additional features.",
+    ]
+
+    real_world = (
+        f"This model could be used to predict '{target}' based on the provided features. "
+        f"For instance, it could assist in automated decision-making workflows, "
+        f"enabling targeted interventions to improve outcomes."
+    )
+
+    return AISummaryResponse(
+        executive_summary=exec_summary,
+        key_insights=insights,
+        recommendations=recommendations,
+        real_world_example=real_world,
     )

@@ -32,6 +32,14 @@ AI_Kosh_Project/shared_workspace/3_models/
 *.sw?
 .DS_Store
 
+# Images & Screenshots
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+Screenshot*
+
 # OS
 Thumbs.db
 desktop.ini

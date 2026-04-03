@@ -11,6 +11,23 @@ interface Props {
 }
 
 const STAGES = ['queued', 'data_check', 'features', 'training', 'evaluation', 'complete'];
+
+function _countModelsFromLogs(messages: { message: string }[]): number {
+  return messages.filter(m => m.message.includes('AutoML: starting ')).length;
+}
+
+function _extractActiveModel(messages: { message: string }[]): string {
+  const ALGOS = ['StackedEnsemble', 'DeepLearning', 'XGBoost', 'GBM', 'GLM', 'DRF', 'XRT'];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i].message;
+    if (msg.includes('AutoML: starting') || msg.includes('New leader')) {
+      for (const algo of ALGOS) {
+        if (msg.includes(algo)) return algo;
+      }
+    }
+  }
+  return '-';
+}
 const STAGE_LABELS: Record<string, string> = {
   queued: 'Queued', data_check: 'Data Check', features: 'Features',
   training: 'Training', evaluation: 'Evaluation', complete: 'Complete',
@@ -142,8 +159,21 @@ export default function StepTraining({ runId, onComplete, reviewMode = false }: 
           <h4>Training Status</h4>
           <div className="aw-status-row">
             <span>Status</span>
-            <span className="aw-status-value">{status?.status === 'complete' ? 'Complete' : status?.status === 'failed' ? 'Failed' : 'Running'}</span>
+            <span className={`aw-status-badge ${status?.status === 'complete' ? 'aw-status-badge--complete' : status?.status === 'failed' ? 'aw-status-badge--failed' : 'aw-status-badge--running'}`}>
+              {status?.status === 'complete' ? 'Complete' : status?.status === 'failed' ? 'Failed' : 'Running'}
+            </span>
           </div>
+          {!isComplete ? (
+            <div className="aw-status-row">
+              <span>Training</span>
+              <span className="aw-status-badge aw-status-badge--running">{_extractActiveModel(messages)}</span>
+            </div>
+          ) : (
+            <div className="aw-status-row">
+              <span>Models Trained</span>
+              <span className="aw-status-value">{_countModelsFromLogs(messages)}</span>
+            </div>
+          )}
           <div className="aw-status-row">
             <span>Total Logs</span>
             <span className="aw-status-value">{messages.length}</span>

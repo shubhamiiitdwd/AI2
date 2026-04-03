@@ -19,7 +19,7 @@ from modules.team1_automl.router import router
 app = FastAPI(
     title="AI Kosh - Team 1 AutoML (Local Test)",
     description="Independent test server for the AutoML Wizard module",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 app.add_middleware(

@@ -10,8 +10,11 @@ from .schemas import (
     LeaderboardResponse, FeatureImportanceResponse,
     ConfusionMatrixResponse, ResidualsResponse, ExportResponse,
     UseCaseSuggestionsResponse,
+    PredictRequest, PredictResponse, GainsLiftResponse, AISummaryResponse,
+    HFDatasetInfo, HFImportRequest,
 )
 from . import services
+from . import hf_datasets
 
 router = APIRouter(prefix="/team1", tags=["Team 1 - AutoML"])
 
@@ -26,6 +29,18 @@ async def upload_dataset(file: UploadFile = File(...)):
 @router.get("/datasets", response_model=list[DatasetMetadata])
 async def list_datasets():
     return await services.list_datasets()
+
+
+# HuggingFace routes must come before {dataset_id} wildcard routes
+@router.get("/datasets/huggingface/browse")
+async def browse_hf_datasets(task: Optional[str] = Query(default=None)):
+    return hf_datasets.get_curated_list(task)
+
+
+@router.post("/datasets/huggingface/import", response_model=DatasetMetadata)
+async def import_hf_dataset(req: HFImportRequest):
+    result = await hf_datasets.import_hf_dataset(req.hf_id)
+    return result
 
 
 @router.get("/datasets/{dataset_id}/preview", response_model=DatasetPreviewResponse)
@@ -112,3 +127,23 @@ async def get_residuals(run_id: str):
 @router.get("/results/{run_id}/export")
 async def export_results(run_id: str, format: str = Query(default="csv")):
     return await services.export_results(run_id, format)
+
+
+@router.post("/results/{run_id}/predict", response_model=PredictResponse)
+async def predict(run_id: str, req: PredictRequest):
+    return await services.predict(run_id, req)
+
+
+@router.get("/results/{run_id}/random-row")
+async def random_row(run_id: str):
+    return await services.get_random_row(run_id)
+
+
+@router.get("/results/{run_id}/gains-lift", response_model=GainsLiftResponse)
+async def get_gains_lift(run_id: str):
+    return await services.get_gains_lift(run_id)
+
+
+@router.post("/results/{run_id}/ai-summary", response_model=AISummaryResponse)
+async def generate_ai_summary(run_id: str):
+    return await services.generate_ai_summary(run_id)
