@@ -7,7 +7,12 @@ import type {
   HFDatasetInfo,
 } from './types';
 
-const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8001';
+// In development, use empty string so requests go through the Vite proxy
+// (configured in vite.config.ts) which avoids CORS issues.
+// In production, use the VITE_API_URL environment variable.
+const BASE = import.meta.env.PROD
+  ? (import.meta.env.VITE_API_URL ?? 'http://localhost:8001')
+  : '';
 const api = axios.create({ baseURL: BASE });
 
 export const uploadDataset = async (file: File): Promise<DatasetMetadata> => {
@@ -125,6 +130,10 @@ export const importHFDataset = async (hfId: string): Promise<DatasetMetadata> =>
 };
 
 export const getWsUrl = (runId: string) => {
-  const wsBase = BASE.replace(/^http/, 'ws');
+  // In dev mode (BASE is empty), derive WebSocket URL from current page origin
+  // so it goes through the Vite proxy.
+  const wsBase = BASE
+    ? BASE.replace(/^http/, 'ws')
+    : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`;
   return `${wsBase}/team1/ws/training/${runId}`;
 };
