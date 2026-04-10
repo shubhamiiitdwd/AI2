@@ -16,6 +16,12 @@ class ModelType(str, Enum):
     STACKED_ENSEMBLE = "StackedEnsemble"
 
 
+class ClusteringAlgorithm(str, Enum):
+    KMEANS = "kmeans"
+    DBSCAN = "dbscan"
+    GMM = "gmm"
+
+
 class TrainingStatus(str, Enum):
     QUEUED = "queued"
     DATA_CHECK = "data_check"
@@ -25,6 +31,9 @@ class TrainingStatus(str, Enum):
     COMPLETE = "complete"
     FAILED = "failed"
     STOPPED = "stopped"
+    CLUSTERING = "clustering"
+    CLUSTERING_EVAL = "clustering_eval"
+    POST_ML = "post_ml"
 
 
 class StorageMode(str, Enum):

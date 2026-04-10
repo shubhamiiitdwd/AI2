@@ -6,6 +6,7 @@ import { aiSourceDisplay } from '../aiSource';
 
 interface Props {
   runId: string;
+  onBack?: () => void;
 }
 
 interface GainsLiftRow {
@@ -22,7 +23,7 @@ interface PredictionResult {
   error?: string;
 }
 
-export default function StepResults({ runId }: Props) {
+export default function StepResults({ runId, onBack }: Props) {
   const [leaderboard, setLeaderboard] = useState<LeaderboardResponse | null>(null);
   const [bestModelData, setBestModelData] = useState<Record<string, unknown> | null>(null);
   const [loading, setLoading] = useState(true);
@@ -50,9 +51,13 @@ export default function StepResults({ runId }: Props) {
         setLeaderboard(lb);
         setBestModelData(bm);
 
-        if (lb && lb.models[0]) {
-          const firstMetric = Object.keys(lb.models[0].metrics).find(k => lb.models[0].metrics[k] != null);
-          if (firstMetric) setSortMetric(firstMetric);
+        if (lb) {
+          if (lb.primary_metric) {
+            setSortMetric(lb.primary_metric);
+          } else if (lb.models[0]) {
+            const firstMetric = Object.keys(lb.models[0].metrics).find(k => lb.models[0].metrics[k] != null);
+            if (firstMetric) setSortMetric(firstMetric);
+          }
         }
 
         const featureCols = (bm as Record<string, unknown>)?.feature_columns as string[] | undefined;
@@ -137,10 +142,12 @@ export default function StepResults({ runId }: Props) {
     ? Object.keys(leaderboard.models[0].metrics).filter(k => leaderboard.models[0].metrics[k] != null)
     : [];
 
+  const HIGHER_IS_BETTER = new Set(['auc', 'accuracy', 'r2', 'f1', 'precision', 'recall']);
+
   const sortedModels = [...leaderboard.models].sort((a, b) => {
-    const av = a.metrics[sortMetric] ?? Infinity;
-    const bv = b.metrics[sortMetric] ?? Infinity;
-    return (Number(av) || 0) - (Number(bv) || 0);
+    const av = Number(a.metrics[sortMetric] ?? (HIGHER_IS_BETTER.has(sortMetric) ? -Infinity : Infinity));
+    const bv = Number(b.metrics[sortMetric] ?? (HIGHER_IS_BETTER.has(sortMetric) ? -Infinity : Infinity));
+    return HIGHER_IS_BETTER.has(sortMetric) ? bv - av : av - bv;
   });
 
   const primaryMetric = leaderboard.primary_metric || metricKeys[0] || 'mean_per_class_error';
@@ -168,12 +175,16 @@ export default function StepResults({ runId }: Props) {
   const METRIC_LABELS: Record<string, string> = {
     auc: 'AUC', accuracy: 'ACCURACY', logloss: 'LOG LOSS', rmse: 'RMSE',
     mse: 'MSE', mae: 'MAE', r2: 'R²', f1: 'F1', precision: 'PRECISION',
-    recall: 'RECALL', mean_per_class_error: 'MEAN_PER_CLASS_ERROR', rmsle: 'RMSLE',
+    recall: 'RECALL', mean_per_class_error: 'MEAN PER CLASS ERROR', rmsle: 'RMSLE',
+    mean_residual_deviance: 'DEVIANCE', deviance: 'DEVIANCE',
   };
 
   return (
     <div className="aw-step-content">
       <div className="aw-step-main aw-step-main--wide">
+        {onBack && (
+          <button className="aw-back-btn" onClick={onBack}>← Back to Training</button>
+        )}
         {/* Best Model Card */}
         <div className="aw-best-model-card">
           <div className="aw-best-model-info">
@@ -207,7 +218,10 @@ export default function StepResults({ runId }: Props) {
         <div className="aw-lb-header">
           <div>
             <h3>Model Leaderboard</h3>
-            <p className="aw-lb-subtitle">Top performing models ranked by {(sortMetric || '').toUpperCase()}</p>
+            <p className="aw-lb-subtitle">
+              Top performing models ranked by {METRIC_LABELS[sortMetric] || (sortMetric || '').toUpperCase()}
+              {' '}({HIGHER_IS_BETTER.has(sortMetric) ? 'higher is better' : 'lower is better'})
+            </p>
           </div>
         </div>
 

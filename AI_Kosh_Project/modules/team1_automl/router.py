@@ -9,9 +9,11 @@ from .schemas import (
     TrainingStartRequest, TrainingStartResponse, TrainingStatusResponse,
     LeaderboardResponse, FeatureImportanceResponse,
     ConfusionMatrixResponse, ResidualsResponse, ExportResponse,
-    UseCaseSuggestionsResponse,
+    UseCaseSuggestionsResponse, AutoDetectTaskResponse,
     PredictRequest, PredictResponse, GainsLiftResponse, AISummaryResponse,
     HFDatasetInfo, HFImportRequest,
+    ClusteringStartRequest, ClusteringStartResponse,
+    ClusteringResultResponse, ElbowResponse,
 )
 from . import services
 from . import hf_datasets
@@ -63,6 +65,11 @@ async def delete_dataset(dataset_id: str):
 @router.get("/configure/suggest-usecases/{dataset_id}", response_model=UseCaseSuggestionsResponse)
 async def suggest_usecases(dataset_id: str):
     return await services.suggest_usecases(dataset_id)
+
+
+@router.post("/configure/auto-detect-task/{dataset_id}", response_model=AutoDetectTaskResponse)
+async def auto_detect_task(dataset_id: str):
+    return await services.auto_detect_task(dataset_id)
 
 
 @router.post("/configure/ai-recommend", response_model=AIRecommendResponse)
@@ -147,3 +154,35 @@ async def get_gains_lift(run_id: str):
 @router.post("/results/{run_id}/ai-summary", response_model=AISummaryResponse)
 async def generate_ai_summary(run_id: str):
     return await services.generate_ai_summary(run_id)
+
+
+# ── Clustering ─────────────────────────────────────────────────────────────
+
+@router.post("/clustering/start", response_model=ClusteringStartResponse)
+async def start_clustering(req: ClusteringStartRequest):
+    return await services.start_clustering(req)
+
+
+@router.get("/clustering/{run_id}/status")
+async def clustering_status(run_id: str):
+    return await services.get_clustering_status(run_id)
+
+
+@router.get("/clustering/{run_id}/result", response_model=ClusteringResultResponse)
+async def clustering_result(run_id: str):
+    return await services.get_clustering_result(run_id)
+
+
+@router.get("/clustering/{run_id}/elbow", response_model=ElbowResponse)
+async def clustering_elbow(run_id: str):
+    return await services.get_elbow_analysis(run_id)
+
+
+@router.post("/clustering/{run_id}/apply-labels", response_model=DatasetMetadata)
+async def apply_cluster_labels(run_id: str, dataset_id: str):
+    return await services.apply_cluster_labels(run_id, dataset_id)
+
+
+@router.websocket("/ws/clustering/{run_id}")
+async def clustering_ws(websocket: WebSocket, run_id: str):
+    await services.clustering_websocket(websocket, run_id)

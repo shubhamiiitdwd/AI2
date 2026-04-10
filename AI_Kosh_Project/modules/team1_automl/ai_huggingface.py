@@ -1,7 +1,8 @@
 import json
+import re
 import logging
 from .config import HUGGINGFACE_TOKEN, HUGGINGFACE_MODEL
-from .schemas import AIRecommendResponse, AISummaryResponse, ColumnInfo
+from .schemas import AIRecommendResponse, AISummaryResponse, ColumnInfo, AutoDetectTaskResponse, UseCaseSuggestion
 
 logger = logging.getLogger(__name__)
 
@@ -159,3 +160,161 @@ async def generate_results_summary(
         logger.warning(f"HF summary failed: {e}")
 
     raise Exception("HF summary generation failed")
+
+
+# ── Rule-based auto task detection ─────────────────────────────────────────
+
+def _is_numeric(col: ColumnInfo) -> bool:
+    return col.dtype in ("float64", "int64", "float32", "int32")
+
+
+def _is_id_like(name: str) -> bool:
+    n = name.lower().strip()
+    if n in {"id", "uuid", "guid", "index", "rownum", "serial"}:
+        return True
+    if n in {"customerid", "orderid", "userid", "productid", "customer_id", "order_id", "user_id", "product_id"}:
+        return True
+    if n.endswith("_id") or n.startswith("id_"):
+        return True
+    return re.search(r"(^|_)(uuid|guid|rownum|serial|index)($|_)", n) is not None
+
+
+async def auto_detect_task(
+    columns: list[ColumnInfo],
+    sample_rows: list[dict],
+    filename: str,
+) -> AutoDetectTaskResponse:
+    """Rule-based task detection as fallback when Azure is not available."""
+    fn = filename.lower()
+    candidate_cols = [c for c in columns if not _is_id_like(c.name)]
+    numeric_cols = [c for c in candidate_cols if _is_numeric(c)]
+
+    cls_score = 0
+    reg_score = 0
+    clust_score = 0
+
+    cls_keywords = ("class", "label", "species", "segment", "status", "category",
+                    "type", "churn", "survived", "fraud", "default", "outcome", "target")
+    reg_keywords = ("price", "cost", "amount", "revenue", "sales", "value", "score",
+                    "rate", "salary", "income", "demand", "load", "weight")
+    clust_keywords = ("cluster", "mall", "customer_segment", "shopping")
+
+    for c in candidate_cols:
+        nm = c.name.lower()
+        if any(k in nm for k in cls_keywords):
+            cls_score += 30
+        if any(k in nm for k in reg_keywords):
+            reg_score += 30
+        if c.dtype == "object" and c.unique_count <= 20:
+            cls_score += 5
+        if _is_numeric(c) and c.unique_count > 50:
+            reg_score += 5
+
+    if any(k in fn for k in clust_keywords):
+        clust_score += 50
+    if any(k in fn for k in ("iris", "fraud", "churn", "class", "spam", "sentiment")):
+        cls_score += 40
+    if any(k in fn for k in ("housing", "price", "sales", "regression", "boston")):
+        reg_score += 40
+
+    no_clear_target = all(
+        _is_id_like(c.name) or (_is_numeric(c) and c.unique_count > 50)
+        for c in columns
+    )
+    if no_clear_target and len(numeric_cols) >= 3:
+        clust_score += 30
+
+    scores = {"classification": cls_score, "regression": reg_score, "clustering": clust_score}
+    task = max(scores, key=scores.get)  # type: ignore
+    if all(v == 0 for v in scores.values()):
+        task = "classification"
+
+    conf = "high" if scores[task] >= 40 else ("medium" if scores[task] >= 20 else "low")
+
+    suggestions = _build_rule_based_suggestions(columns, candidate_cols, numeric_cols, filename)
+
+    return AutoDetectTaskResponse(
+        task=task,
+        confidence=conf,
+        reasoning=f"Rule-based analysis of column names, data types, and filename patterns suggests {task}.",
+        suggestions=suggestions,
+        source="rule-based",
+    )
+
+
+async def suggest_usecases(
+    columns: list[ColumnInfo],
+    sample_rows: list[dict],
+    filename: str,
+) -> list[UseCaseSuggestion]:
+    """Rule-based use-case suggestion fallback."""
+    candidate_cols = [c for c in columns if not _is_id_like(c.name)]
+    numeric_cols = [c for c in candidate_cols if _is_numeric(c)]
+    return _build_rule_based_suggestions(columns, candidate_cols, numeric_cols, filename)
+
+
+def _build_rule_based_suggestions(
+    columns: list[ColumnInfo],
+    candidate_cols: list[ColumnInfo],
+    numeric_cols: list[ColumnInfo],
+    filename: str,
+) -> list[UseCaseSuggestion]:
+    """Shared logic for building rule-based suggestions."""
+    cls_keywords = ("class", "label", "species", "segment", "status", "category",
+                    "type", "churn", "survived", "fraud", "default", "outcome", "target")
+    reg_keywords = ("price", "cost", "amount", "revenue", "sales", "value", "score",
+                    "rate", "salary", "income", "demand", "load", "weight")
+
+    suggestions: list[UseCaseSuggestion] = []
+
+    for c in candidate_cols[:10]:
+        nm = c.name.lower()
+        if any(k in nm for k in cls_keywords):
+            suggestions.append(UseCaseSuggestion(
+                use_case=f"Classify {c.name} from the remaining features",
+                ml_task="classification",
+                target_hint=c.name,
+            ))
+        if any(k in nm for k in reg_keywords):
+            suggestions.append(UseCaseSuggestion(
+                use_case=f"Predict {c.name} using regression",
+                ml_task="regression",
+                target_hint=c.name,
+            ))
+
+    if not any(s.ml_task == "classification" for s in suggestions):
+        for c in candidate_cols:
+            if (c.dtype == "object" or c.unique_count <= 20) and not _is_id_like(c.name):
+                suggestions.append(UseCaseSuggestion(
+                    use_case=f"Classify {c.name} based on other columns",
+                    ml_task="classification",
+                    target_hint=c.name,
+                ))
+                break
+
+    if not any(s.ml_task == "regression" for s in suggestions):
+        for c in numeric_cols:
+            if c.unique_count > 20:
+                suggestions.append(UseCaseSuggestion(
+                    use_case=f"Predict {c.name} as a continuous value",
+                    ml_task="regression",
+                    target_hint=c.name,
+                ))
+                break
+
+    if len(numeric_cols) >= 2:
+        top_feats = ", ".join(c.name for c in numeric_cols[:3])
+        suggestions.append(UseCaseSuggestion(
+            use_case=f"Cluster records into groups using numeric features ({top_feats})",
+            ml_task="clustering",
+            target_hint="No target (unsupervised)",
+        ))
+
+    seen = set()
+    unique: list[UseCaseSuggestion] = []
+    for s in suggestions:
+        key = (s.ml_task, s.target_hint)
+        if key not in seen:
+            seen.add(key)
+            unique.append(s)
+    return unique[:5]

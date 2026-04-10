@@ -4,7 +4,9 @@ import type {
   AIRecommendResponse, TrainingStartRequest, TrainingStartResponse,
   TrainingStatusResponse, LeaderboardResponse, FeatureImportanceResponse,
   ConfusionMatrixResponse, ResidualsResponse, UseCaseSuggestionsResponse,
-  HFDatasetInfo, AISummaryResponse,
+  HFDatasetInfo, AISummaryResponse, AutoDetectTaskResponse,
+  ClusteringStartRequest, ClusteringStartResponse,
+  ClusteringResultResponse, ElbowResponse,
 } from './types';
 
 // Dev: empty baseURL → requests go to Vite; vite.config.ts proxies /team1 to FastAPI (no CORS).
@@ -42,6 +44,11 @@ export const deleteDataset = async (id: string): Promise<void> => {
 
 export const suggestUseCases = async (datasetId: string): Promise<UseCaseSuggestionsResponse> => {
   const { data } = await api.get(`/team1/configure/suggest-usecases/${datasetId}`);
+  return data;
+};
+
+export const autoDetectTask = async (datasetId: string): Promise<AutoDetectTaskResponse> => {
+  const { data } = await api.post(`/team1/configure/auto-detect-task/${datasetId}`);
   return data;
 };
 
@@ -126,6 +133,43 @@ export const browseHFDatasets = async (task?: string): Promise<HFDatasetInfo[]> 
 export const importHFDataset = async (hfId: string): Promise<DatasetMetadata> => {
   const { data } = await api.post('/team1/datasets/huggingface/import', { hf_id: hfId });
   return data;
+};
+
+// ── Clustering API ──────────────────────────────────────────────────────
+
+export const startClustering = async (req: ClusteringStartRequest): Promise<ClusteringStartResponse> => {
+  const { data } = await api.post('/team1/clustering/start', req);
+  return data;
+};
+
+export const getClusteringStatus = async (runId: string): Promise<TrainingStatusResponse> => {
+  const { data } = await api.get(`/team1/clustering/${runId}/status`);
+  return data;
+};
+
+export const getClusteringResult = async (runId: string): Promise<ClusteringResultResponse> => {
+  const { data } = await api.get(`/team1/clustering/${runId}/result`);
+  return data;
+};
+
+export const getElbowAnalysis = async (runId: string): Promise<ElbowResponse> => {
+  const { data } = await api.get(`/team1/clustering/${runId}/elbow`);
+  return data;
+};
+
+export const applyClusterLabels = async (runId: string, datasetId: string): Promise<DatasetMetadata> => {
+  const { data } = await api.post(`/team1/clustering/${runId}/apply-labels?dataset_id=${datasetId}`);
+  return data;
+};
+
+export const getClusteringWsUrl = (runId: string) => {
+  if (BASE) {
+    const wsBase = BASE.replace(/^http/, 'ws');
+    return `${wsBase}/team1/ws/clustering/${runId}`;
+  }
+  const host = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
+  const port = import.meta.env.VITE_BACKEND_PORT || '8001';
+  return `ws://${host}:${port}/team1/ws/clustering/${runId}`;
 };
 
 export const getWsUrl = (runId: string) => {

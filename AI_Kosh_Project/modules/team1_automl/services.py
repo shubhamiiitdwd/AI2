@@ -30,6 +30,11 @@ from .schemas import (
     PredictRequest, PredictResponse, PredictionModelResult,
     GainsLiftResponse, GainsLiftRow,
     BestModelSummary, AISummaryResponse,
+    AutoDetectTaskResponse,
+    ClusteringStartRequest, ClusteringStartResponse,
+    ClusteringResultResponse, ClusterMetrics, StabilityResult,
+    CandidateModelResult, ClusterSummary, ClusterFeatureImportance,
+    DimensionReductionPoint, ElbowResponse, ElbowDataPoint,
 )
 from .enums import MLTask, TrainingStatus
 from . import data_processor
@@ -37,6 +42,7 @@ from . import storage_service
 from . import ai_service
 from . import h2o_engine
 from . import team_db
+from . import clustering_engine
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +51,31 @@ _websocket_connections: dict[str, list[WebSocket]] = {}
 
 
 # ── Dataset Management ─────────────────────────────────────────────────────
+
+def _sanitize_for_json(obj):
+    """Recursively convert numpy/pandas types to native Python for JSON serialization."""
+    import numpy as np
+
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        val = float(obj)
+        if math.isnan(val) or math.isinf(val):
+            return None
+        return val
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return [_sanitize_for_json(v) for v in obj.tolist()]
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+    return obj
+
 
 async def upload_dataset(file: UploadFile) -> DatasetMetadata:
     content = await file.read()
@@ -122,11 +153,132 @@ async def suggest_usecases(dataset_id: str) -> UseCaseSuggestionsResponse:
     filepath = storage.get_dataset_path(dataset_id, ds.filename)
     columns_info = data_processor.get_columns(filepath, dataset_id)
 
+    import pandas as pd
+    sample_rows = pd.read_csv(filepath, nrows=15).fillna("").to_dict(orient="records")
+
+    ai = ai_service.get_ai_service()
+    try:
+        suggestions = await ai.suggest_usecases(columns_info.columns, sample_rows, ds.filename)
+        return UseCaseSuggestionsResponse(dataset_id=dataset_id, suggestions=suggestions)
+    except Exception as exc:
+        logger.warning("AI use-case suggestion failed, falling back to built-in rules: %s", exc)
+
     suggestions = _generate_usecase_suggestions(columns_info.columns, ds.filename)
     return UseCaseSuggestionsResponse(dataset_id=dataset_id, suggestions=suggestions)
 
 
+async def auto_detect_task(dataset_id: str) -> AutoDetectTaskResponse:
+    ds = team_db.get_dataset(dataset_id)
+    if not ds:
+        raise HTTPException(404, "Dataset not found")
+    storage = storage_service.get_storage()
+    filepath = storage.get_dataset_path(dataset_id, ds.filename)
+    columns_info = data_processor.get_columns(filepath, dataset_id)
+
+    import pandas as pd
+    sample_rows = pd.read_csv(filepath, nrows=15).fillna("").to_dict(orient="records")
+
+    ai = ai_service.get_ai_service()
+    try:
+        return await ai.auto_detect_task(columns_info.columns, sample_rows, ds.filename)
+    except Exception as exc:
+        logger.warning("AI auto-detect failed, using rule-based: %s", exc)
+
+    from . import ai_huggingface
+    return await ai_huggingface.auto_detect_task(columns_info.columns, sample_rows, ds.filename)
+
+
+async def _generate_usecase_suggestions_gpt(columns: list[ColumnInfo], filename: str) -> list[UseCaseSuggestion]:
+    """Use Azure OpenAI GPT-4o to generate intelligent use-case suggestions."""
+    from .config import (
+        AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT,
+        AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_API_VERSION,
+    )
+    from openai import AsyncAzureOpenAI
+
+    client = AsyncAzureOpenAI(
+        api_key=AZURE_OPENAI_API_KEY,
+        api_version=AZURE_OPENAI_API_VERSION,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    )
+
+    col_desc = "\n".join(
+        f"- {c.name} ({c.dtype}, {c.null_count} nulls, {c.unique_count} unique)"
+        for c in columns
+    )
+
+    response = await client.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a data science expert. Given a dataset's column metadata and filename, "
+                    "suggest up to 5 practical machine-learning use cases. "
+                    "Each use case must include:\n"
+                    "  - use_case: a clear, one-sentence description of the ML objective.\n"
+                    "  - ml_task: one of 'classification', 'regression', or 'clustering'.\n"
+                    "  - target_hint: the column name to use as the target (or 'No target (unsupervised)' for clustering).\n\n"
+                    "Return ONLY a JSON array (no markdown, no explanations):\n"
+                    '[{"use_case": "...", "ml_task": "...", "target_hint": "..."}, ...]'
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Dataset filename: {filename}\n\n"
+                    f"Columns:\n{col_desc}\n\n"
+                    f"Suggest up to 5 use cases. JSON array only."
+                ),
+            },
+        ],
+        max_tokens=600,
+        temperature=0.4,
+    )
+
+    text = response.choices[0].message.content.strip()
+
+    # Parse the JSON array from the response (handle markdown fences)
+    cleaned = text
+    if cleaned.startswith("```"):
+        first_nl = cleaned.index("\n") if "\n" in cleaned else len(cleaned)
+        cleaned = cleaned[first_nl + 1:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3].strip()
+
+    items = json.loads(cleaned)
+    if isinstance(items, dict) and "suggestions" in items:
+        items = items["suggestions"]
+
+    valid_cols = {c.name for c in columns}
+    suggestions: list[UseCaseSuggestion] = []
+    for item in items[:5]:
+        ml_task = item.get("ml_task", "classification").lower()
+        if ml_task not in ("classification", "regression", "clustering"):
+            ml_task = "classification"
+        target = item.get("target_hint", "")
+        # Validate target column exists (skip bad hallucinations)
+        if ml_task != "clustering" and target not in valid_cols:
+            target_lower = target.lower()
+            matched = next((c for c in valid_cols if c.lower() == target_lower), None)
+            if matched:
+                target = matched
+            else:
+                continue
+        suggestions.append(UseCaseSuggestion(
+            use_case=item.get("use_case", ""),
+            ml_task=ml_task,
+            target_hint=target,
+        ))
+
+    if not suggestions:
+        raise ValueError("GPT-4o returned no valid suggestions")
+
+    return suggestions
+
+
 def _generate_usecase_suggestions(columns: list[ColumnInfo], filename: str) -> list[UseCaseSuggestion]:
+    """Rule-based fallback for use-case suggestions (used when Azure is unavailable)."""
     if not columns:
         return []
 
@@ -440,6 +592,15 @@ async def _run_training(run_id: str):
                 is_best=(i == 0),
             ))
 
+        # Detect number of target classes for binary vs multiclass metric selection
+        n_target_classes = 2
+        try:
+            if req.ml_task.value == "classification" and frame is not None:
+                n_target_classes = frame[req.target_column].nlevels()[0]
+        except Exception:
+            pass
+
+        run["n_target_classes"] = n_target_classes
         run["result"] = {
             "leaderboard": models_result,
             "feature_importance": varimp,
@@ -555,15 +716,24 @@ async def get_leaderboard(run_id: str) -> LeaderboardResponse:
 
     result = run["result"]
 
-    # Pick a primary metric that actually exists in leaderboard rows.
+    # H2O default sort metric per Appendix D:
+    #   binary classification → AUC
+    #   multiclass classification → mean_per_class_error
+    #   regression → deviance (mean_residual_deviance)
     metric_keys: list[str] = []
     if result["leaderboard"]:
         metric_keys = [k for k in result["leaderboard"][0].metrics.keys()]
 
-    if result["ml_task"] == "classification":
-        pref = ["auc", "logloss", "mean_per_class_error", "accuracy", "rmse", "mse"]
+    ml_task = result["ml_task"]
+    target_classes = run.get("n_target_classes", 2)
+
+    if ml_task == "classification":
+        if target_classes <= 2:
+            pref = ["auc", "logloss", "mean_per_class_error", "accuracy"]
+        else:
+            pref = ["mean_per_class_error", "logloss", "auc", "accuracy"]
     else:
-        pref = ["rmse", "mae", "r2", "mse", "rmsle"]
+        pref = ["mean_residual_deviance", "rmse", "mae", "mse", "rmsle", "r2"]
 
     primary_metric = next((m for m in pref if m in metric_keys), (metric_keys[0] if metric_keys else "score"))
 
@@ -921,3 +1091,320 @@ def _rule_based_summary(best_algo, best_id, target, ml_task, metrics, num_models
         real_world_example=real_world,
         source="rule-based",
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Clustering AutoML Pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+
+_clustering_runs: dict[str, dict] = {}
+_clustering_ws: dict[str, list[WebSocket]] = {}
+
+
+async def start_clustering(req: ClusteringStartRequest) -> ClusteringStartResponse:
+    ds = team_db.get_dataset(req.dataset_id)
+    if not ds:
+        raise HTTPException(404, "Dataset not found")
+
+    run_id = "cl-" + str(uuid.uuid4())[:8]
+    _clustering_runs[run_id] = {
+        "status": "queued",
+        "progress": 0,
+        "message": "Queued",
+        "request": req,
+        "dataset": ds,
+        "result": None,
+        "elbow": None,
+    }
+    _clustering_ws.setdefault(run_id, [])
+
+    asyncio.create_task(_run_clustering(run_id))
+    return ClusteringStartResponse(run_id=run_id, status="queued", message="Clustering queued")
+
+
+async def _clustering_broadcast(run_id: str, pct: int, msg: str):
+    run = _clustering_runs.get(run_id)
+    if run:
+        run["progress"] = pct
+        run["message"] = msg
+
+    payload = json.dumps({
+        "type": "progress",
+        "progress": pct,
+        "message": msg,
+        "timestamp": datetime.now().isoformat(),
+    })
+    dead = []
+    for ws in _clustering_ws.get(run_id, []):
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        _clustering_ws[run_id].remove(ws)
+
+
+async def _run_clustering(run_id: str):
+    import pandas as pd
+
+    run = _clustering_runs.get(run_id)
+    if not run:
+        return
+
+    req: ClusteringStartRequest = run["request"]
+    ds: DatasetMetadata = run["dataset"]
+
+    try:
+        run["status"] = "clustering"
+        await _clustering_broadcast(run_id, 5, "Loading dataset...")
+
+        storage = storage_service.get_storage()
+        filepath = storage.get_dataset_path(req.dataset_id, ds.filename)
+        df = pd.read_csv(filepath)
+
+        progress_events: list[tuple[int, str]] = []
+
+        def progress_cb(pct, msg):
+            progress_events.append((pct, msg))
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: clustering_engine.run_full_pipeline(
+                df=df,
+                feature_cols=req.feature_columns,
+                user_algorithm=req.algorithm,
+                user_n_clusters=req.n_clusters,
+                user_eps=req.eps,
+                user_min_samples=req.min_samples,
+                run_stability=req.run_stability_check,
+                progress_callback=progress_cb,
+            ),
+        )
+
+        for pct, msg in progress_events:
+            await _clustering_broadcast(run_id, pct, msg)
+
+        sanitized = _sanitize_for_json(result)
+        run["result"] = sanitized
+        run["elbow"] = {
+            "data": sanitized["elbow_data"],
+            "recommended_k": sanitized["recommended_k"],
+        }
+
+        # Post-clustering H2O ML
+        post_ml_run_id = None
+        if req.run_post_ml and req.post_ml_target:
+            await _clustering_broadcast(run_id, 90, "Starting post-clustering H2O AutoML...")
+            try:
+                df["cluster_label"] = result["best_labels"]
+                features_with_cluster = req.feature_columns + ["cluster_label"]
+                post_ml_req = TrainingStartRequest(
+                    dataset_id=req.dataset_id,
+                    target_column=req.post_ml_target,
+                    feature_columns=features_with_cluster,
+                    ml_task=MLTask(req.post_ml_task or "classification"),
+                    models=[],
+                    auto_mode=True,
+                    train_test_split=0.8,
+                    nfolds=5,
+                    max_models=req.post_ml_max_models,
+                    max_runtime_secs=req.post_ml_max_runtime_secs,
+                )
+                post_resp = await start_training(post_ml_req)
+                post_ml_run_id = post_resp.run_id
+                run["result"]["post_ml_run_id"] = post_ml_run_id
+                run["result"]["post_ml_status"] = "running"
+            except Exception as e:
+                logger.warning(f"Post-clustering ML failed: {e}")
+                run["result"]["post_ml_run_id"] = None
+                run["result"]["post_ml_status"] = f"failed: {e}"
+
+        # Save clustered CSV with cluster_label column
+        await _clustering_broadcast(run_id, 95, "Saving clustered dataset...")
+        try:
+            df["cluster_label"] = result["best_labels"]
+            clustered_filename = ds.filename.replace(".csv", "_clustered.csv")
+            clustered_path = Path(filepath).parent / clustered_filename
+            df.to_csv(str(clustered_path), index=False)
+            run["clustered_filepath"] = str(clustered_path)
+            run["clustered_filename"] = clustered_filename
+            logger.info(f"Saved clustered dataset: {clustered_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save clustered CSV: {e}")
+
+        run["status"] = "complete"
+        n_tested = result["total_candidates_tested"]
+        best_algo = result["best_algorithm"]
+        best_score = result["best_metrics"]["composite_score"]
+
+        # Persist result + elbow to disk so they survive backend restarts
+        try:
+            persist_dir = PROCESSED_DATA_DIR / run_id
+            persist_dir.mkdir(parents=True, exist_ok=True)
+            with open(persist_dir / "clustering_result.json", "w") as f:
+                json.dump(run["result"], f)
+            with open(persist_dir / "clustering_elbow.json", "w") as f:
+                json.dump(run["elbow"], f)
+            logger.info(f"Persisted clustering result to {persist_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to persist clustering result: {e}")
+
+        await _clustering_broadcast(
+            run_id, 100,
+            f"Tested {n_tested} models. Best: {best_algo} (score: {best_score:.3f})",
+        )
+
+    except Exception as e:
+        logger.error(f"Clustering run {run_id} failed: {e}", exc_info=True)
+        run["status"] = "failed"
+        run["message"] = str(e)
+        await _clustering_broadcast(run_id, 0, f"Clustering failed: {e}")
+
+
+async def get_clustering_status(run_id: str) -> TrainingStatusResponse:
+    run = _clustering_runs.get(run_id)
+    if not run:
+        raise HTTPException(404, "Clustering run not found")
+    return TrainingStatusResponse(
+        run_id=run_id,
+        status=TrainingStatus(run["status"]) if run["status"] in TrainingStatus.__members__.values() else TrainingStatus.TRAINING,
+        progress_percent=run["progress"],
+        current_stage=run["status"],
+        message=run["message"],
+    )
+
+
+def _load_clustering_result_from_disk(run_id: str) -> dict | None:
+    """Load persisted clustering result from disk as fallback."""
+    result_file = PROCESSED_DATA_DIR / run_id / "clustering_result.json"
+    if result_file.exists():
+        try:
+            with open(result_file, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load clustering result from disk: {e}")
+    return None
+
+
+def _load_clustering_elbow_from_disk(run_id: str) -> dict | None:
+    """Load persisted elbow analysis from disk as fallback."""
+    elbow_file = PROCESSED_DATA_DIR / run_id / "clustering_elbow.json"
+    if elbow_file.exists():
+        try:
+            with open(elbow_file, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load elbow data from disk: {e}")
+    return None
+
+
+async def get_clustering_result(run_id: str) -> ClusteringResultResponse:
+    run = _clustering_runs.get(run_id)
+    r = run["result"] if run and run.get("result") else None
+
+    if not r:
+        r = _load_clustering_result_from_disk(run_id)
+
+    if not r:
+        raise HTTPException(404, "Clustering result not found")
+
+    return ClusteringResultResponse(
+        run_id=run_id,
+        best_algorithm=r["best_algorithm"],
+        best_params=r["best_params"],
+        best_metrics=ClusterMetrics(**r["best_metrics"]),
+        stability=StabilityResult(**r["stability"]) if r.get("stability") else None,
+        cluster_summaries=[ClusterSummary(**s) for s in r["cluster_summaries"]],
+        leaderboard=[CandidateModelResult(**m) for m in r["leaderboard"]],
+        feature_importance=[
+            ClusterFeatureImportance(feature=f["feature"], importance=f["importance"] if f["importance"] is not None else 0.0)
+            for f in r["feature_importance"]
+        ],
+        feature_columns=r["feature_columns"],
+        total_candidates_tested=r["total_candidates_tested"],
+        pca_points=[DimensionReductionPoint(**p) for p in r["pca_points"]] if r.get("pca_points") else None,
+        post_ml_run_id=r.get("post_ml_run_id"),
+        post_ml_status=r.get("post_ml_status"),
+    )
+
+
+async def get_elbow_analysis(run_id: str) -> ElbowResponse:
+    run = _clustering_runs.get(run_id)
+    e = run["elbow"] if run and run.get("elbow") else None
+
+    if not e:
+        e = _load_clustering_elbow_from_disk(run_id)
+
+    if not e:
+        raise HTTPException(404, "Elbow analysis not found")
+
+    return ElbowResponse(
+        run_id=run_id,
+        data=[ElbowDataPoint(**d) for d in e["data"]],
+        recommended_k=e["recommended_k"],
+    )
+
+
+async def apply_cluster_labels(run_id: str, dataset_id: str) -> DatasetMetadata:
+    """Register the clustered CSV as a new dataset and return its metadata."""
+
+    # Try in-memory cache first
+    run = _clustering_runs.get(run_id)
+    clustered_path = None
+    clustered_filename = None
+
+    if run and run.get("clustered_filepath"):
+        clustered_path = Path(run["clustered_filepath"])
+        clustered_filename = run["clustered_filename"]
+    else:
+        # Fallback: find on disk by looking at the source dataset's directory
+        ds = team_db.get_dataset(dataset_id)
+        if ds:
+            storage = storage_service.get_storage()
+            src_path = Path(storage.get_dataset_path(dataset_id, ds.filename))
+            candidate = src_path.parent / ds.filename.replace(".csv", "_clustered.csv")
+            if candidate.exists():
+                clustered_path = candidate
+                clustered_filename = candidate.name
+
+    if not clustered_path or not clustered_path.exists():
+        raise HTTPException(404, "Clustered dataset not found. Please re-run clustering.")
+
+    if not clustered_filename:
+        clustered_filename = clustered_path.name
+
+    existing = team_db.find_dataset_by_filename(clustered_filename)
+    if existing:
+        storage = storage_service.get_storage()
+        try:
+            storage.delete_dataset(existing.id, existing.filename)
+        except Exception:
+            pass
+        team_db.delete_dataset(existing.id)
+
+    new_dataset_id = "cld-" + str(uuid.uuid4())[:8]
+    storage = storage_service.get_storage()
+    content = clustered_path.read_bytes()
+    storage.save_dataset(new_dataset_id, clustered_filename, content)
+    meta = data_processor.get_metadata(
+        storage.get_dataset_path(new_dataset_id, clustered_filename),
+        new_dataset_id,
+        clustered_filename,
+    )
+    meta.description = f"Clustered version with cluster_label column (from run {run_id})"
+    team_db.save_dataset(meta)
+    return meta
+
+
+async def clustering_websocket(websocket: WebSocket, run_id: str):
+    await websocket.accept()
+    _clustering_ws.setdefault(run_id, []).append(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if websocket in _clustering_ws.get(run_id, []):
+            _clustering_ws[run_id].remove(websocket)

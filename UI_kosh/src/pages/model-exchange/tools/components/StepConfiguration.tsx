@@ -18,12 +18,12 @@ interface Props {
   onMaxModelsChange: (n: number) => void;
   onMaxRuntimeChange: (n: number) => void;
   onStartTraining: () => void;
+  onBack?: () => void;
 }
 
 const TASKS: { value: MLTask; label: string; desc: string; icon: string }[] = [
   { value: 'classification', label: 'Classification', desc: 'Predict categorical outcomes', icon: '📈' },
   { value: 'regression', label: 'Regression', desc: 'Predict continuous values', icon: '📉' },
-  { value: 'clustering', label: 'Clustering', desc: 'Group similar data points', icon: '🔗' },
 ];
 
 const ALL_MODELS: ModelType[] = ['DRF', 'GLM', 'XGBoost', 'GBM', 'DeepLearning', 'StackedEnsemble'];
@@ -39,7 +39,7 @@ export default function StepConfiguration({
   trainTestSplit, nfolds, maxModels, maxRuntimeSecs,
   onTaskChange, onModelsChange, onAutoModeChange,
   onSplitChange, onNfoldsChange, onMaxModelsChange, onMaxRuntimeChange,
-  onStartTraining,
+  onStartTraining, onBack,
 }: Props) {
   const [hyperTab, setHyperTab] = useState<'basic' | 'advanced'>('basic');
 
@@ -54,6 +54,9 @@ export default function StepConfiguration({
   return (
     <div className="aw-step-content">
       <div className="aw-step-main">
+        {onBack && (
+          <button className="aw-back-btn" onClick={onBack}>← Back to Configure Data</button>
+        )}
         <div className="aw-auto-mode">
           <span>Auto Mode</span>
           <label className="aw-toggle">

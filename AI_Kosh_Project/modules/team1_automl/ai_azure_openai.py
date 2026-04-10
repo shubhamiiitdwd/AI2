@@ -1,5 +1,6 @@
 """
-Azure OpenAI implementation for column recommendation and AI summary.
+Azure OpenAI implementation for column recommendation, AI summary,
+auto task detection, and smart use-case suggestions.
 Activated when AZURE_OPENAI_API_KEY is set in .env.
 """
 import json
@@ -8,7 +9,7 @@ from .config import (
     AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT,
     AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_API_VERSION,
 )
-from .schemas import AIRecommendResponse, AISummaryResponse, ColumnInfo
+from .schemas import AIRecommendResponse, AISummaryResponse, ColumnInfo, AutoDetectTaskResponse, UseCaseSuggestion
 
 logger = logging.getLogger(__name__)
 
@@ -147,3 +148,155 @@ async def generate_results_summary(
         real_world_example=data.get("real_world_example", ""),
         source="azure",
     )
+
+
+async def auto_detect_task(
+    columns: list[ColumnInfo],
+    sample_rows: list[dict],
+    filename: str,
+) -> AutoDetectTaskResponse:
+    """Use Azure OpenAI to determine the best ML task for a dataset."""
+    client = _get_client()
+
+    col_desc = "\n".join(
+        f"- {c.name} ({c.dtype}, {c.null_count} nulls, {c.unique_count} unique)"
+        for c in columns
+    )
+    rows_preview = json.dumps(sample_rows[:15], default=str)
+
+    response = await client.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a data science expert. Given a dataset's column metadata, "
+                    "sample rows, and filename, determine the best ML task.\n"
+                    "Respond in this exact JSON format:\n"
+                    '{"task": "classification"|"regression"|"clustering", '
+                    '"confidence": "high"|"medium"|"low", '
+                    '"reasoning": "one paragraph explanation", '
+                    '"suggestions": [{"use_case": "...", "ml_task": "...", "target_hint": "..."}]}\n'
+                    "Include 3-5 use case suggestions. For clustering, target_hint should be "
+                    "'No target (unsupervised)'."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Dataset: {filename}\n\nColumns:\n{col_desc}\n\n"
+                    f"Sample rows (first 15):\n{rows_preview}\n\n"
+                    f"What ML task is this dataset best suited for? JSON only."
+                ),
+            },
+        ],
+        max_tokens=700,
+        temperature=0.3,
+    )
+
+    text = response.choices[0].message.content.strip()
+    data = _parse_json_response(text)
+
+    task = data.get("task", "classification").lower()
+    if task not in ("classification", "regression", "clustering"):
+        task = "classification"
+
+    valid_cols = {c.name for c in columns}
+    suggestions = []
+    for item in data.get("suggestions", [])[:5]:
+        ml = item.get("ml_task", task).lower()
+        if ml not in ("classification", "regression", "clustering"):
+            ml = task
+        th = item.get("target_hint", "")
+        if ml != "clustering" and th not in valid_cols:
+            matched = next((c for c in valid_cols if c.lower() == th.lower()), None)
+            th = matched or ""
+        suggestions.append(UseCaseSuggestion(
+            use_case=item.get("use_case", ""),
+            ml_task=ml,
+            target_hint=th,
+        ))
+
+    return AutoDetectTaskResponse(
+        task=task,
+        confidence=data.get("confidence", "medium"),
+        reasoning=data.get("reasoning", "Detected via Azure OpenAI"),
+        suggestions=suggestions,
+        source="azure",
+    )
+
+
+async def suggest_usecases(
+    columns: list[ColumnInfo],
+    sample_rows: list[dict],
+    filename: str,
+) -> list[UseCaseSuggestion]:
+    """Generate smart use-case suggestions via Azure OpenAI."""
+    client = _get_client()
+
+    col_desc = "\n".join(
+        f"- {c.name} ({c.dtype}, {c.null_count} nulls, {c.unique_count} unique)"
+        for c in columns
+    )
+    rows_preview = json.dumps(sample_rows[:10], default=str)
+
+    response = await client.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a data science expert. Given dataset metadata and sample rows, "
+                    "suggest up to 5 practical ML use cases.\n"
+                    "Each must include: use_case (one sentence), ml_task (classification/regression/clustering), "
+                    "target_hint (column name, or 'No target (unsupervised)' for clustering).\n"
+                    "Return ONLY a JSON array:\n"
+                    '[{"use_case": "...", "ml_task": "...", "target_hint": "..."}, ...]'
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Dataset: {filename}\n\nColumns:\n{col_desc}\n\n"
+                    f"Sample rows:\n{rows_preview}\n\nSuggest up to 5 use cases. JSON array only."
+                ),
+            },
+        ],
+        max_tokens=600,
+        temperature=0.4,
+    )
+
+    text = response.choices[0].message.content.strip()
+    cleaned = text
+    if cleaned.startswith("```"):
+        first_nl = cleaned.index("\n") if "\n" in cleaned else len(cleaned)
+        cleaned = cleaned[first_nl + 1:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3].strip()
+
+    items = json.loads(cleaned)
+    if isinstance(items, dict) and "suggestions" in items:
+        items = items["suggestions"]
+
+    valid_cols = {c.name for c in columns}
+    suggestions: list[UseCaseSuggestion] = []
+    for item in items[:5]:
+        ml = item.get("ml_task", "classification").lower()
+        if ml not in ("classification", "regression", "clustering"):
+            ml = "classification"
+        th = item.get("target_hint", "")
+        if ml != "clustering" and th not in valid_cols:
+            matched = next((c for c in valid_cols if c.lower() == th.lower()), None)
+            if matched:
+                th = matched
+            else:
+                continue
+        suggestions.append(UseCaseSuggestion(
+            use_case=item.get("use_case", ""),
+            ml_task=ml,
+            target_hint=th,
+        ))
+
+    if not suggestions:
+        raise ValueError("Azure OpenAI returned no valid suggestions")
+    return suggestions

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import type { ColumnInfo, DatasetMetadata, AIRecommendResponse, DatasetPreviewResponse, UseCaseSuggestion, MLTask } from '../types';
+import type { ColumnInfo, DatasetMetadata, AIRecommendResponse, DatasetPreviewResponse, UseCaseSuggestion, MLTask, AutoDetectTaskResponse } from '../types';
 import * as api from '../api';
 import { aiSourceDisplay } from '../aiSource';
 
@@ -13,11 +13,15 @@ interface Props {
   onFeaturesChange: (cols: string[]) => void;
   onTaskSuggest: (task: MLTask) => void;
   onContinue: () => void;
+  onClusteringDetected?: () => void;
+  onBack?: () => void;
+  backLabel?: string;
 }
 
 export default function StepConfigureData({
   datasetId, dataset, columns, targetColumn, featureColumns,
   onTargetChange, onFeaturesChange, onTaskSuggest, onContinue,
+  onClusteringDetected, onBack, backLabel,
 }: Props) {
   const [activeTab, setActiveTab] = useState<'config' | 'preview'>('config');
   const [useCase, setUseCase] = useState('');
@@ -28,6 +32,9 @@ export default function StepConfigureData({
   const [suggestionsLoading, setSuggestionsLoading] = useState(false);
   const [taskFilter, setTaskFilter] = useState<MLTask | null>(null);
 
+  const [detectResult, setDetectResult] = useState<AutoDetectTaskResponse | null>(null);
+  const [detecting, setDetecting] = useState(false);
+
   useEffect(() => {
     setSuggestionsLoading(true);
     api.suggestUseCases(datasetId)
@@ -35,6 +42,30 @@ export default function StepConfigureData({
       .catch(() => {})
       .finally(() => setSuggestionsLoading(false));
   }, [datasetId]);
+
+  const handleAutoDetect = async () => {
+    setDetecting(true);
+    try {
+      const result = await api.autoDetectTask(datasetId);
+      setDetectResult(result);
+      if (result.suggestions.length > 0) {
+        setSuggestions(result.suggestions);
+      }
+      const detectedTask = result.task as MLTask;
+      setTaskFilter(detectedTask);
+      onTaskSuggest(detectedTask);
+      if (detectedTask === 'clustering' && onClusteringDetected) {
+        onClusteringDetected();
+      }
+    } catch { /* ignore */ }
+    finally { setDetecting(false); }
+  };
+
+  const handleTaskSelect = (task: MLTask) => {
+    setTaskFilter(task);
+    onTaskSuggest(task);
+    setDetectResult(null);
+  };
 
   const handleAIRecommend = async () => {
     if (!useCase.trim()) return;
@@ -44,8 +75,6 @@ export default function StepConfigureData({
       setAiResult(result);
       onTargetChange(result.target_column);
       onFeaturesChange(result.features);
-      // Align pipeline task with user's selected AI task filter to avoid
-      // classification/regression mismatch in training/results.
       if (taskFilter) onTaskSuggest(taskFilter);
     } catch { /* ignore */ }
     finally { setAiLoading(false); }
@@ -83,6 +112,9 @@ export default function StepConfigureData({
   return (
     <div className="aw-step-content">
       <div className="aw-step-main">
+        {onBack && (
+          <button className="aw-back-btn" onClick={onBack}>{backLabel || '← Back to Select Dataset'}</button>
+        )}
         <div className="aw-tab-bar">
           <button
             className={`aw-tab ${activeTab === 'config' ? 'aw-tab--active' : ''}`}
@@ -191,18 +223,50 @@ export default function StepConfigureData({
           <h4>🤖 AI Assistant</h4>
           <p className="aw-ai-desc">Describe your use case and let AI recommend the optimal configuration</p>
 
+          {/* Auto-Detect Task */}
+          <div className="aw-auto-detect-section">
+            <button
+              className="aw-btn aw-btn--detect aw-btn--full"
+              onClick={handleAutoDetect}
+              disabled={detecting}
+            >
+              {detecting ? 'Analyzing dataset...' : '🔍 Auto-Detect Task (AI)'}
+            </button>
+            {detectResult && (
+              <div className="aw-detect-result">
+                <div className="aw-detect-task-badge">
+                  Detected: <strong>{detectResult.task.toUpperCase()}</strong>
+                  <span className={`aw-badge aw-badge--${detectResult.confidence === 'high' ? 'green' : detectResult.confidence === 'medium' ? 'orange' : 'red'}`}>
+                    {detectResult.confidence}
+                  </span>
+                </div>
+                <p className="aw-detect-reasoning">{detectResult.reasoning}</p>
+                <div className="aw-detect-source">
+                  <span className={`aw-badge ${aiSourceDisplay(detectResult.source).badgeClass}`}>
+                    {aiSourceDisplay(detectResult.source).label}
+                  </span>
+                </div>
+                {detectResult.task === 'clustering' && onClusteringDetected && (
+                  <button className="aw-btn aw-btn--primary aw-btn--full" onClick={onClusteringDetected}>
+                    Start Clustering Pipeline →
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+
+          <hr className="aw-ai-divider" />
+
+          {/* Suggested Use Cases — Classification & Regression only */}
           {suggestions.length > 0 && (
             <div className="aw-ai-suggestions">
               <label className="aw-ai-label">💡 Suggested Use Cases</label>
               <div className="aw-suggestion-filter">
-                {(['classification', 'regression', 'clustering'] as const).map((task) => (
+                {(['classification', 'regression'] as const).map((task) => (
                   <button
                     key={task}
                     className={`aw-suggestion-filter-btn ${taskFilter === task ? 'aw-suggestion-filter-btn--active' : ''}`}
-                    onClick={() => {
-                      setTaskFilter(task);
-                      onTaskSuggest(task);
-                    }}
+                    onClick={() => handleTaskSelect(task)}
                   >
                     {task}
                   </button>
@@ -220,7 +284,7 @@ export default function StepConfigureData({
                     className={`aw-suggestion-chip ${useCase === s.use_case ? 'aw-suggestion-chip--active' : ''}`}
                     onClick={() => {
                       setUseCase(s.use_case);
-                      if (s.ml_task === 'classification' || s.ml_task === 'regression' || s.ml_task === 'clustering') {
+                      if (s.ml_task === 'classification' || s.ml_task === 'regression') {
                         const t = s.ml_task as MLTask;
                         setTaskFilter(t);
                         onTaskSuggest(t);

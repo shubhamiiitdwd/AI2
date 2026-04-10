@@ -8,32 +8,40 @@ const STEPS = [
   { label: 'Results', icon: '📊' },
 ];
 
+const CLUSTERING_OVERRIDES: Record<number, { label: string; icon: string }> = {
+  3: { label: 'Clustering', icon: '🔬' },
+};
+
 interface Props {
   currentStep: WizardStep;
   onStepClick?: (step: WizardStep) => void;
   completedSteps?: number[];
+  isClustering?: boolean;
 }
 
-export default function WizardStepper({ currentStep, onStepClick, completedSteps = [] }: Props) {
+export default function WizardStepper({ currentStep, onStepClick, completedSteps = [], isClustering = false }: Props) {
   return (
     <div className="aw-stepper">
-      {STEPS.map((step, i) => {
+      {STEPS.map((s, i) => {
+        const step = isClustering && CLUSTERING_OVERRIDES[i] ? CLUSTERING_OVERRIDES[i] : s;
         const isCompleted = completedSteps.includes(i);
         const isActive = i === currentStep;
-        const isPending = i > currentStep && !isCompleted;
+        const isClickable = isCompleted || i <= currentStep;
 
         let cls = 'aw-step';
         if (isCompleted) cls += ' aw-step--completed';
         else if (isActive) cls += ' aw-step--active';
-        else if (isPending) cls += ' aw-step--pending';
+        else cls += ' aw-step--pending';
+        if (isClickable) cls += ' aw-step--clickable';
 
         return (
           <div key={i} className="aw-step-wrapper">
             <div
               className={cls}
               onClick={() => {
-                if ((isCompleted || i <= currentStep) && onStepClick) onStepClick(i as WizardStep);
+                if (isClickable && onStepClick) onStepClick(i as WizardStep);
               }}
+              style={{ cursor: isClickable ? 'pointer' : 'default' }}
             >
               <div className="aw-step-circle">
                 {isCompleted ? '✓' : step.icon}

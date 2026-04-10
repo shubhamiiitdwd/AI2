@@ -55,6 +55,14 @@ export interface AISummaryResponse {
   source?: string;
 }
 
+export interface AutoDetectTaskResponse {
+  task: 'classification' | 'regression' | 'clustering';
+  confidence: string;
+  reasoning: string;
+  suggestions: UseCaseSuggestion[];
+  source: string;
+}
+
 export interface TrainingStartRequest {
   dataset_id: string;
   target_column: string;
@@ -138,6 +146,101 @@ export interface WizardState {
   runId: string | null;
   trainingStatus: TrainingStatusResponse | null;
   leaderboard: LeaderboardResponse | null;
+  clusteringResult: ClusteringResultResponse | null;
+}
+
+// ── Clustering Types ──────────────────────────────────────────────────────
+
+export interface ClusteringStartRequest {
+  dataset_id: string;
+  feature_columns: string[];
+  algorithm?: string;
+  n_clusters?: number;
+  eps?: number;
+  min_samples?: number;
+  run_stability_check: boolean;
+  post_ml_max_models?: number;
+  post_ml_max_runtime_secs?: number;
+}
+
+export interface ClusteringStartResponse {
+  run_id: string;
+  status: string;
+  message: string;
+}
+
+export interface CandidateModelResult {
+  rank: number;
+  algorithm: string;
+  params: Record<string, unknown>;
+  n_clusters: number;
+  n_noise_points: number;
+  silhouette: number;
+  calinski_harabasz: number;
+  davies_bouldin: number;
+  composite_score: number;
+  is_best: boolean;
+}
+
+export interface StabilityResult {
+  avg_ari: number;
+  is_stable: boolean;
+  n_runs: number;
+}
+
+export interface ClusterMetrics {
+  silhouette_score: number;
+  calinski_harabasz: number;
+  davies_bouldin: number;
+  composite_score: number;
+  n_clusters: number;
+  n_noise_points: number;
+}
+
+export interface ClusterSummary {
+  cluster_id: number;
+  size: number;
+  percentage: number;
+  centroid: Record<string, number>;
+}
+
+export interface ClusterFeatureImportance {
+  feature: string;
+  importance: number;
+}
+
+export interface DimensionReductionPoint {
+  x: number;
+  y: number;
+  cluster: number;
+}
+
+export interface ClusteringResultResponse {
+  run_id: string;
+  best_algorithm: string;
+  best_params: Record<string, unknown>;
+  best_metrics: ClusterMetrics;
+  stability: StabilityResult | null;
+  cluster_summaries: ClusterSummary[];
+  leaderboard: CandidateModelResult[];
+  feature_importance: ClusterFeatureImportance[];
+  feature_columns: string[];
+  total_candidates_tested: number;
+  pca_points: DimensionReductionPoint[] | null;
+  post_ml_run_id: string | null;
+  post_ml_status: string | null;
+}
+
+export interface ElbowDataPoint {
+  k: number;
+  inertia: number;
+  silhouette: number;
+}
+
+export interface ElbowResponse {
+  run_id: string;
+  data: ElbowDataPoint[];
+  recommended_k: number;
 }
 
 export interface HFDatasetInfo {

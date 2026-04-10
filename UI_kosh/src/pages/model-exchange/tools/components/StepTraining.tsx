@@ -8,6 +8,7 @@ interface Props {
   runId: string;
   onComplete: () => void;
   reviewMode?: boolean;
+  onBack?: () => void;
 }
 
 const STAGES = ['queued', 'data_check', 'features', 'training', 'evaluation', 'complete'];
@@ -33,7 +34,7 @@ const STAGE_LABELS: Record<string, string> = {
   training: 'Training', evaluation: 'Evaluation', complete: 'Complete',
 };
 
-export default function StepTraining({ runId, onComplete, reviewMode = false }: Props) {
+export default function StepTraining({ runId, onComplete, reviewMode = false, onBack }: Props) {
   const wsUrl = getWsUrl(runId);
   const { messages, lastMessage, connected } = useTrainingWebSocket(wsUrl);
   const [status, setStatus] = useState<TrainingStatusResponse | null>(null);
@@ -104,6 +105,9 @@ export default function StepTraining({ runId, onComplete, reviewMode = false }: 
   return (
     <div className="aw-step-content">
       <div className="aw-step-main">
+        {onBack && (
+          <button className="aw-back-btn" onClick={onBack}>← Back to Configuration</button>
+        )}
         {isStarting && (
           <div className="aw-starting">
             <div className="aw-starting-icon">⏳</div>

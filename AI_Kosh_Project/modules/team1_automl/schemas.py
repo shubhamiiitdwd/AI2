@@ -181,6 +181,14 @@ class AISummaryResponse(BaseModel):
     source: str = "rule-based"
 
 
+class AutoDetectTaskResponse(BaseModel):
+    task: str
+    confidence: str
+    reasoning: str
+    suggestions: list["UseCaseSuggestion"] = []
+    source: str = "rule-based"
+
+
 class HFDatasetInfo(BaseModel):
     hf_id: str
     hf_url: str
@@ -196,3 +204,100 @@ class HFDatasetInfo(BaseModel):
 
 class HFImportRequest(BaseModel):
     hf_id: str
+
+
+# ── Clustering AutoML Schemas ──────────────────────────────────────────────
+
+class ClusteringStartRequest(BaseModel):
+    dataset_id: str
+    feature_columns: list[str]
+    algorithm: Optional[str] = None
+    n_clusters: Optional[int] = None
+    eps: Optional[float] = None
+    min_samples: Optional[int] = None
+    run_stability_check: bool = True
+    run_post_ml: bool = False
+    post_ml_target: Optional[str] = None
+    post_ml_task: Optional[str] = None
+    post_ml_max_models: int = 10
+    post_ml_max_runtime_secs: int = 180
+
+
+class ClusteringStartResponse(BaseModel):
+    run_id: str
+    status: str
+    message: str
+
+
+class CandidateModelResult(BaseModel):
+    rank: int
+    algorithm: str
+    params: dict
+    n_clusters: int
+    n_noise_points: int = 0
+    silhouette: float
+    calinski_harabasz: float
+    davies_bouldin: float
+    composite_score: float
+    is_best: bool = False
+
+
+class StabilityResult(BaseModel):
+    avg_ari: float
+    is_stable: bool
+    n_runs: int
+
+
+class ClusterMetrics(BaseModel):
+    silhouette_score: float
+    calinski_harabasz: float
+    davies_bouldin: float
+    composite_score: float
+    n_clusters: int
+    n_noise_points: int = 0
+
+
+class ClusterSummary(BaseModel):
+    cluster_id: int
+    size: int
+    percentage: float
+    centroid: dict
+
+
+class ClusterFeatureImportance(BaseModel):
+    feature: str
+    importance: float = 0.0
+
+
+class DimensionReductionPoint(BaseModel):
+    x: float
+    y: float
+    cluster: int
+
+
+class ClusteringResultResponse(BaseModel):
+    run_id: str
+    best_algorithm: str
+    best_params: dict
+    best_metrics: ClusterMetrics
+    stability: Optional[StabilityResult] = None
+    cluster_summaries: list[ClusterSummary]
+    leaderboard: list[CandidateModelResult]
+    feature_importance: list[ClusterFeatureImportance]
+    feature_columns: list[str]
+    total_candidates_tested: int
+    pca_points: Optional[list[DimensionReductionPoint]] = None
+    post_ml_run_id: Optional[str] = None
+    post_ml_status: Optional[str] = None
+
+
+class ElbowDataPoint(BaseModel):
+    k: int
+    inertia: float
+    silhouette: float
+
+
+class ElbowResponse(BaseModel):
+    run_id: str
+    data: list[ElbowDataPoint]
+    recommended_k: int
