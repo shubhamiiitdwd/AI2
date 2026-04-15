@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 import type { LeaderboardResponse, AISummaryResponse } from '../types';
 import * as api from '../api';
@@ -23,6 +23,46 @@ interface PredictionResult {
   error?: string;
 }
 
+function pickMetric(
+  key: string,
+  allMetrics: Record<string, number>,
+  bestMetrics: Record<string, number> | undefined,
+  lbBest: Record<string, number | null> | undefined,
+): number | null {
+  const raw = allMetrics[key] ?? bestMetrics?.[key] ?? lbBest?.[key];
+  if (raw == null || Number.isNaN(Number(raw))) return null;
+  return Number(raw);
+}
+
+function buildPerfCardEntries(
+  mlTask: string,
+  allMetrics: Record<string, number>,
+  bestMetrics: Record<string, number> | undefined,
+  lbBest: Record<string, number | null> | undefined,
+): { key: string; value: number | null }[] {
+  const classificationOrder = [
+    'mean_per_class_error', 'logloss', 'precision', 'recall', 'f1',
+    'auc', 'accuracy', 'rmse', 'mse',
+  ];
+  const regressionOrder = ['rmse', 'mae', 'mse', 'r2', 'rmsle', 'mean_residual_deviance'];
+  const isClassification = mlTask === 'classification';
+  const order = isClassification ? classificationOrder : regressionOrder;
+  const seen = new Set<string>();
+  const rows: { key: string; value: number | null }[] = [];
+  for (const k of order) {
+    seen.add(k);
+    const forceShow = isClassification && (k === 'precision' || k === 'recall' || k === 'f1');
+    const v = pickMetric(k, allMetrics, bestMetrics, lbBest);
+    if (v != null || forceShow) rows.push({ key: k, value: v });
+  }
+  for (const k of Object.keys(allMetrics)) {
+    if (seen.has(k)) continue;
+    seen.add(k);
+    rows.push({ key: k, value: allMetrics[k] ?? null });
+  }
+  return rows;
+}
+
 export default function StepResults({ runId, onBack }: Props) {
   const [leaderboard, setLeaderboard] = useState<LeaderboardResponse | null>(null);
   const [bestModelData, setBestModelData] = useState<Record<string, unknown> | null>(null);
@@ -41,38 +81,52 @@ export default function StepResults({ runId, onBack }: Props) {
   const [showPasteCSV, setShowPasteCSV] = useState(false);
   const [csvText, setCsvText] = useState('');
 
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const [lb, bm] = await Promise.all([
-          api.getLeaderboard(runId),
-          api.getBestModel(runId).catch(() => null),
-        ]);
-        setLeaderboard(lb);
-        setBestModelData(bm);
+  const loadResults = useCallback(async (isInitial: boolean) => {
+    try {
+      const [lb, bm] = await Promise.all([
+        api.getLeaderboard(runId),
+        api.getBestModel(runId).catch(() => null),
+      ]);
+      setLeaderboard(lb);
+      setBestModelData(bm);
 
-        if (lb) {
-          if (lb.primary_metric) {
-            setSortMetric(lb.primary_metric);
-          } else if (lb.models[0]) {
-            const firstMetric = Object.keys(lb.models[0].metrics).find(k => lb.models[0].metrics[k] != null);
-            if (firstMetric) setSortMetric(firstMetric);
-          }
+      if (lb && isInitial) {
+        if (lb.primary_metric) {
+          setSortMetric(lb.primary_metric);
+        } else if (lb.models[0]) {
+          const firstMetric = Object.keys(lb.models[0].metrics).find(k => lb.models[0].metrics[k] != null);
+          if (firstMetric) setSortMetric(firstMetric);
         }
+      }
 
-        const featureCols = (bm as Record<string, unknown>)?.feature_columns as string[] | undefined;
-        if (featureCols) {
-          const initial: Record<string, string> = {};
-          featureCols.forEach(c => { initial[c] = ''; });
-          setFeatureValues(initial);
-        }
+      const featureCols = (bm as Record<string, unknown>)?.feature_columns as string[] | undefined;
+      if (featureCols && isInitial) {
+        const initial: Record<string, string> = {};
+        featureCols.forEach(c => { initial[c] = ''; });
+        setFeatureValues(initial);
+      }
 
+      if (isInitial) {
         api.getGainsLift(runId).then(gl => setGainsLift(gl.rows || [])).catch(() => {});
-      } catch { /* ignore */ }
-      finally { setLoading(false); }
-    };
-    load();
+      }
+    } catch { /* ignore */ }
+    finally {
+      if (isInitial) setLoading(false);
+    }
   }, [runId]);
+
+  useEffect(() => {
+    setLoading(true);
+    void loadResults(true);
+  }, [loadResults]);
+
+  // Refresh leaderboard / best model when the backend updates (re-run, new metrics).
+  useEffect(() => {
+    const t = window.setInterval(() => {
+      void loadResults(false);
+    }, 20000);
+    return () => window.clearInterval(t);
+  }, [loadResults]);
 
   const handleGenerateSummary = async () => {
     setAiLoading(true);
@@ -130,7 +184,8 @@ export default function StepResults({ runId, onBack }: Props) {
 
   const allMetrics = (bestModelData as Record<string, unknown>)?.all_metrics as Record<string, number> || {};
   const bestModel = (bestModelData as Record<string, unknown>)?.best_model as Record<string, unknown> || {};
-  const mlTask = (bestModelData as Record<string, unknown>)?.ml_task as string || leaderboard.ml_task;
+  const mlTaskRaw = (bestModelData as Record<string, unknown>)?.ml_task as string || leaderboard.ml_task;
+  const mlTask = (mlTaskRaw || '').toLowerCase();
   const targetCol = (bestModelData as Record<string, unknown>)?.target_column as string || '';
 
   const bestAlgo = (bestModel?.algorithm as string)
@@ -152,6 +207,14 @@ export default function StepResults({ runId, onBack }: Props) {
 
   const primaryMetric = leaderboard.primary_metric || metricKeys[0] || 'mean_per_class_error';
   const bestMetrics = bestModel?.metrics as Record<string, number> | undefined;
+  const lbBestMetrics = leaderboard.models.find(m => m.is_best)?.metrics;
+  const perfCardEntries = buildPerfCardEntries(
+    mlTask,
+    allMetrics,
+    bestMetrics,
+    lbBestMetrics,
+  );
+
   const bestPrimaryValue = allMetrics[primaryMetric]
     ?? bestMetrics?.[primaryMetric]
     ?? leaderboard.models.find(m => m.is_best)?.metrics[primaryMetric]
@@ -203,11 +266,11 @@ export default function StepResults({ runId, onBack }: Props) {
         <div className="aw-perf-section">
           <h3 className="aw-perf-title">📈 Performance Metrics</h3>
           <div className="aw-perf-cards">
-            {Object.entries(allMetrics).map(([k, v]) => (
+            {perfCardEntries.map(({ key: k, value: v }) => (
               <div key={k} className="aw-perf-card">
                 <span className="aw-perf-card-label">{METRIC_LABELS[k] || k.toUpperCase()}</span>
                 <span className="aw-perf-card-value">
-                  {v != null ? (k === 'accuracy' ? `${(Number(v) * 100).toFixed(1)}%` : Number(v).toFixed(4)) : '-'}
+                  {v != null ? (k === 'accuracy' ? `${(Number(v) * 100).toFixed(1)}%` : Number(v).toFixed(4)) : '—'}
                 </span>
               </div>
             ))}

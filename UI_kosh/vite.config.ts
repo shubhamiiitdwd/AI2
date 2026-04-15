@@ -13,7 +13,7 @@ function backendHintPlugin(port: string): Plugin {
         console.log('')
         console.log(`\x1b[33m[AI Kosh]\x1b[0m Proxy /team1 → http://127.0.0.1:${port}`)
         console.log(
-          `\x1b[33m[AI Kosh]\x1b[0m If you see ECONNREFUSED, the API is not running. Start it, or run \x1b[36mnpm run dev:all\x1b[0m to start API + UI together.`,
+          `\x1b[33m[AI Kosh]\x1b[0m \x1b[36mnpm run dev:all\x1b[0m waits for the API on port ${port} before starting Vite. Running \x1b[36mnpm run dev\x1b[0m alone needs the API already up.`,
         )
         console.log('')
       })
@@ -47,6 +47,8 @@ export default defineConfig(({ mode }) => {
         '/team1': {
           target: `http://127.0.0.1:${backendPort}`,
           changeOrigin: true,
+          /** Required for clustering / training WebSocket when the UI uses same-origin ws: URLs. */
+          ws: true,
         },
       },
     },

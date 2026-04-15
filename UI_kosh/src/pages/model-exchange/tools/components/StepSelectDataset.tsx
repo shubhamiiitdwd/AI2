@@ -8,7 +8,7 @@ interface Props {
   dataset: DatasetMetadata | null;
   onSelect: (ds: DatasetMetadata) => void;
   onClusteringSelect?: (ds: DatasetMetadata) => void;
-  onContinue?: (taskChoice?: TaskChoice) => void;
+  onContinue?: (taskChoice?: TaskChoice) => void | Promise<void>;
   onClearDataset?: () => void;
 }
 
@@ -113,12 +113,13 @@ export default function StepSelectDataset({ dataset, onSelect, onClusteringSelec
 
             <button
               className="aw-btn aw-btn--primary aw-btn--full"
-              onClick={() => {
+              onClick={async () => {
+                if (!dataset) return;
                 if (taskChoice === 'clustering' && onClusteringSelect) {
                   onClusteringSelect(dataset);
-                } else {
-                  onContinue?.(taskChoice);
+                  return;
                 }
+                await onContinue?.(taskChoice);
               }}
             >
               {taskChoice === 'clustering' ? 'Start Clustering Pipeline →' : 'Continue to Configure Data →'}

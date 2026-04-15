@@ -33,7 +33,6 @@ class TrainingStatus(str, Enum):
     STOPPED = "stopped"
     CLUSTERING = "clustering"
     CLUSTERING_EVAL = "clustering_eval"
-    POST_ML = "post_ml"
 
 
 class StorageMode(str, Enum):

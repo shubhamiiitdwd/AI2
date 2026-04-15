@@ -43,6 +43,22 @@ export default function StepTraining({ runId, onComplete, reviewMode = false, on
   const logsRef = useRef<HTMLDivElement>(null);
   const hasAutoCompleted = useRef(false);
 
+  // Hydrate status immediately (fixes "Queued 0%" / Running badge when returning from Results).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const s = await api.getTrainingStatus(runId);
+        if (!cancelled) setStatus(s);
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [runId]);
+
   // HTTP polling as fallback — only fires when WebSocket is disconnected.
   useEffect(() => {
     const poll = setInterval(async () => {
@@ -99,8 +115,25 @@ export default function StepTraining({ runId, onComplete, reviewMode = false, on
     navigator.clipboard.writeText(text);
   };
 
-  const isStarting = progress < 10 && currentStage === 'queued' && !reviewMode;
+  const isStarting =
+    !reviewMode && progress < 10 && currentStage === 'queued';
   const isComplete = status?.status === 'complete' || currentStage === 'complete';
+  const statusBadgeLabel =
+    status?.status === 'complete'
+      ? 'Complete'
+      : status?.status === 'failed'
+        ? 'Failed'
+        : status?.status === 'stopped'
+          ? 'Stopped'
+          : status
+            ? 'Running'
+            : 'Loading…';
+  const statusBadgeClass =
+    status?.status === 'complete'
+      ? 'aw-status-badge--complete'
+      : status?.status === 'failed'
+        ? 'aw-status-badge--failed'
+        : 'aw-status-badge--running';
 
   return (
     <div className="aw-step-content">
@@ -165,7 +198,11 @@ export default function StepTraining({ runId, onComplete, reviewMode = false, on
             {filteredMessages.length === 0 && (
               <div className="aw-logs-empty">
                 <span className="aw-logs-cursor">⚡</span>
-                <span>Waiting for training to start...</span>
+                <span>
+                  {reviewMode && isComplete
+                    ? 'This run has finished. Live logs are not replayed after completion—open Results for metrics and exports.'
+                    : 'Waiting for training to start...'}
+                </span>
               </div>
             )}
             {filteredMessages.map((m, i) => (
@@ -183,8 +220,8 @@ export default function StepTraining({ runId, onComplete, reviewMode = false, on
           <h4>Training Status</h4>
           <div className="aw-status-row">
             <span>Status</span>
-            <span className={`aw-status-badge ${status?.status === 'complete' ? 'aw-status-badge--complete' : status?.status === 'failed' ? 'aw-status-badge--failed' : 'aw-status-badge--running'}`}>
-              {status?.status === 'complete' ? 'Complete' : status?.status === 'failed' ? 'Failed' : 'Running'}
+            <span className={`aw-status-badge ${statusBadgeClass}`}>
+              {statusBadgeLabel}
             </span>
           </div>
           {!isComplete ? (

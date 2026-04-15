@@ -259,7 +259,206 @@ def get_confusion_matrix(model, frame) -> Optional[dict]:
     return None
 
 
-def get_model_metrics(model, frame, ml_task: str) -> dict:
+def _mean_if_sequence(val) -> float | None:
+    """H2O sometimes returns a list of per-class metrics for multinomial models."""
+    if val is None:
+        return None
+    if isinstance(val, (list, tuple)):
+        nums = []
+        for x in val:
+            try:
+                fx = float(x)
+                if not (math.isnan(fx) or math.isinf(fx)):
+                    nums.append(fx)
+            except (TypeError, ValueError):
+                continue
+        if not nums:
+            return None
+        return round(sum(nums) / len(nums), 6)
+    try:
+        fx = float(val)
+        if math.isnan(fx) or math.isinf(fx):
+            return None
+        return round(fx, 6)
+    except (TypeError, ValueError):
+        return None
+
+
+def _classification_prf_from_perf(perf) -> dict[str, float]:
+    """Precision, recall, and F1 from H2O model metrics (binomial or multinomial)."""
+    out: dict[str, float] = {}
+    f1_candidates = ("F1", "f1")
+    for key in ("precision", "recall"):
+        try:
+            fn = getattr(perf, key, None)
+            if fn is None:
+                continue
+            raw = fn() if callable(fn) else fn
+            v = _mean_if_sequence(raw)
+            if v is not None:
+                out[key] = v
+        except Exception:
+            continue
+    for name in f1_candidates:
+        try:
+            fn = getattr(perf, name, None)
+            if fn is None:
+                continue
+            raw = fn() if callable(fn) else fn
+            v = _mean_if_sequence(raw)
+            if v is not None:
+                out["f1"] = v
+                break
+        except Exception:
+            continue
+    return out
+
+
+def _macro_prf_from_confusion(perf) -> dict[str, float]:
+    """Macro precision, recall, F1 from the confusion matrix.
+
+    H2OMultinomialModelMetrics often does not expose .precision()/.recall()/.F1();
+    this path works for binomial and multinomial when a confusion matrix exists.
+    """
+    out: dict[str, float] = {}
+    try:
+        cm = perf.confusion_matrix()
+        if cm is None:
+            return out
+        table = getattr(cm, "table", None)
+        if table is None:
+            return out
+        try:
+            df = table.as_data_frame(use_pandas=True)
+        except TypeError:
+            df = table.as_data_frame()
+        if df is None or getattr(df, "empty", True):
+            return out
+    except Exception as e:
+        logger.debug("confusion matrix unavailable for PRF: %s", e)
+        return out
+
+    try:
+        label_col = df.columns[0]
+        df = df.set_index(label_col)
+        # Drop helper columns (Error, Rate, etc.)
+        skip = {"error", "err", "rate", "total"}
+        keep_cols = []
+        for c in df.columns:
+            cl = str(c).strip().lower()
+            if cl in skip or "err" in cl:
+                continue
+            keep_cols.append(c)
+        df = df[keep_cols]
+        df2 = df.copy()
+        df2.index = [str(x).strip() for x in df2.index]
+        df2.columns = [str(x).strip() for x in df2.columns]
+        labels = sorted(set(df2.index) & set(df2.columns))
+        labels = [x for x in labels if x.lower() not in skip]
+        if len(labels) < 2:
+            return out
+        sub = df2.loc[labels, labels]
+        arr = sub.values.astype(float)
+        n = arr.shape[0]
+        if n < 2 or arr.shape[0] != arr.shape[1]:
+            return out
+        precisions = []
+        recalls = []
+        f1s = []
+        for i in range(n):
+            col_sum = float(arr[:, i].sum())
+            row_sum = float(arr[i, :].sum())
+            tp = float(arr[i, i])
+            p = tp / col_sum if col_sum > 0 else 0.0
+            r = tp / row_sum if row_sum > 0 else 0.0
+            precisions.append(p)
+            recalls.append(r)
+            f1s.append((2 * p * r / (p + r)) if (p + r) > 0 else 0.0)
+        out["precision"] = round(sum(precisions) / n, 6)
+        out["recall"] = round(sum(recalls) / n, 6)
+        out["f1"] = round(sum(f1s) / n, 6)
+    except Exception as e:
+        logger.debug("macro PRF from confusion matrix: %s", e)
+    return out
+
+
+def _merge_classification_prf(perf) -> dict[str, float]:
+    """Prefer direct H2O metric methods; fill gaps from confusion matrix (multinomial)."""
+    direct = _classification_prf_from_perf(perf)
+    from_cm = _macro_prf_from_confusion(perf)
+    merged = {**from_cm, **direct}
+    return {k: v for k, v in merged.items() if k in ("precision", "recall", "f1") and v is not None}
+
+
+def _model_response_column(model) -> Optional[str]:
+    """Resolve the training target column name from an H2O model."""
+    try:
+        p = getattr(model, "actual_params", None) or {}
+        rc = p.get("response_column")
+        if isinstance(rc, str):
+            return rc
+        if rc is not None and hasattr(rc, "name"):
+            return str(rc.name)
+    except Exception:
+        pass
+    try:
+        p = getattr(model, "params", None) or {}
+        rc = p.get("response_column")
+        if isinstance(rc, dict):
+            av = rc.get("actual_value")
+            if isinstance(av, str):
+                return av
+            if av is not None and hasattr(av, "name"):
+                return str(av.name)
+    except Exception:
+        pass
+    try:
+        j = getattr(model, "_model_json", None) or {}
+        resp = j.get("response_column_name")
+        if isinstance(resp, str):
+            return resp
+        out = j.get("output", {})
+        if isinstance(out, dict):
+            col = out.get("response_column") or out.get("responseColumnName")
+            if isinstance(col, str):
+                return col
+    except Exception:
+        pass
+    return None
+
+
+def _macro_prf_sklearn(model, frame, target_column: Optional[str] = None) -> dict[str, float]:
+    """Macro precision/recall/F1 from predictions vs actuals (robust for multinomial)."""
+    out: dict[str, float] = {}
+    try:
+        from sklearn.metrics import precision_recall_fscore_support
+
+        target = target_column or _model_response_column(model)
+        if not target:
+            return out
+        names = list(getattr(frame, "names", []) or getattr(frame, "columns", []))
+        if target not in names:
+            return out
+
+        pred = model.predict(frame)
+        y_true = frame[target].asfactor().as_data_frame().iloc[:, 0].astype(str)
+        p_df = pred.as_data_frame()
+        pred_col = "predict" if "predict" in p_df.columns else p_df.columns[0]
+        y_pred = p_df[pred_col].astype(str)
+        if len(y_true) != len(y_pred):
+            return out
+        p, r, f1, _ = precision_recall_fscore_support(
+            y_true, y_pred, average="macro", zero_division=0
+        )
+        out["precision"] = round(float(p), 6)
+        out["recall"] = round(float(r), 6)
+        out["f1"] = round(float(f1), 6)
+    except Exception as e:
+        logger.debug("sklearn macro PRF fallback: %s", e)
+    return out
+
+
+def get_model_metrics(model, frame, ml_task: str, target_column: Optional[str] = None) -> dict:
     metrics = {}
     try:
         perf = model.model_performance(xval=True)
@@ -281,6 +480,13 @@ def get_model_metrics(model, frame, ml_task: str) -> dict:
                 metrics["auc"] = _safe_metric(perf.auc)
             except Exception:
                 pass
+            prf = _merge_classification_prf(perf)
+            metrics.update(prf)
+            if any(k not in metrics for k in ("precision", "recall", "f1")):
+                sk = _macro_prf_sklearn(model, frame, target_column)
+                for k in ("precision", "recall", "f1"):
+                    if k not in metrics and k in sk:
+                        metrics[k] = sk[k]
         else:
             metrics["rmse"] = _safe_metric(perf.rmse)
             metrics["mae"] = _safe_metric(perf.mae)

@@ -90,6 +90,26 @@ export interface TrainingStatusResponse {
   message: string;
 }
 
+export interface TrainingRunSummary {
+  run_id: string;
+  dataset_id: string;
+  dataset_name: string;
+  ml_task: string;
+  target_column: string;
+  best_model_id: string;
+  best_algorithm: string;
+  primary_metric: string;
+  best_metric_value: number;
+  model_count: number;
+  status: string;
+  run_type: string;
+  created_at: string;
+}
+
+export interface TrainingHistoryResponse {
+  runs: TrainingRunSummary[];
+}
+
 export interface ModelResult {
   model_id: string;
   algorithm: string;
@@ -159,8 +179,6 @@ export interface ClusteringStartRequest {
   eps?: number;
   min_samples?: number;
   run_stability_check: boolean;
-  post_ml_max_models?: number;
-  post_ml_max_runtime_secs?: number;
 }
 
 export interface ClusteringStartResponse {
@@ -227,8 +245,6 @@ export interface ClusteringResultResponse {
   feature_columns: string[];
   total_candidates_tested: number;
   pca_points: DimensionReductionPoint[] | null;
-  post_ml_run_id: string | null;
-  post_ml_status: string | null;
 }
 
 export interface ElbowDataPoint {

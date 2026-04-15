@@ -14,6 +14,20 @@ dist-ssr/
 
 # Environment & secrets (keep real tokens only locally; never commit live secrets)
 *.env.local
+AI_Kosh_Project/.env
+UI_kosh/.env
+
+# Root documentation / assets not part of app publish (AI_Kosh_Project + UI_kosh only)
+/AIKoshBackendCodeStructure.docx
+/Frontend.docx
+/ai_kosh_team1_automl_plan.md
+/azure_guide_for_beginners.md
+/h2o_docker_ssh_explained.md
+/implementation_plan.md
+/local_implementation_plan.md
+/pipeline_steps_with_techstack.md
+/project_documentation.md
+/task_summary_for_manager.md
 
 # Runtime data
 *.db

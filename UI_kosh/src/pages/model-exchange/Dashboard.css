@@ -207,6 +207,13 @@
 .mx-stat-change--up {
   color: #27ae60;
 }
+.mx-stat-footnote {
+  font-size: 12px;
+  margin-top: 8px;
+  color: #64748b;
+  line-height: 1.35;
+  font-weight: 500;
+}
 
 /* ── Bottom Panels ───────────────────────────────────────────────────────── */
 .mx-panels {

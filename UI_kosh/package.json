@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "dev:api": "cd ../AI_Kosh_Project && python -m modules.team1_automl.run_local",
-    "dev:all": "concurrently -k -n api,ui -c cyan,magenta \"npm run dev:api\" \"npm run dev\"",
+    "dev:all": "concurrently -k -n api,ui -c cyan,magenta \"npm run dev:api\" \"wait-on tcp:127.0.0.1:8099 && npm run dev\"",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"
@@ -30,6 +30,7 @@
     "globals": "^17.4.0",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.57.0",
-    "vite": "^8.0.1"
+    "vite": "^8.0.1",
+    "wait-on": "^9.0.5"
   }
 }

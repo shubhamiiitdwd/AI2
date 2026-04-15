@@ -1,5 +1,8 @@
 import { useState, useEffect } from 'react';
-import type { ColumnInfo, DatasetMetadata, AIRecommendResponse, DatasetPreviewResponse, UseCaseSuggestion, MLTask, AutoDetectTaskResponse } from '../types';
+import type {
+  ColumnInfo, DatasetMetadata, AIRecommendResponse, DatasetPreviewResponse, UseCaseSuggestion, MLTask, AutoDetectTaskResponse,
+  ClusteringStartRequest,
+} from '../types';
 import * as api from '../api';
 import { aiSourceDisplay } from '../aiSource';
 
@@ -16,14 +19,20 @@ interface Props {
   onClusteringDetected?: () => void;
   onBack?: () => void;
   backLabel?: string;
+  /** Unsupervised: no target column; Continue enabled when at least one feature is selected. */
+  clusteringMode?: boolean;
+  /** When set, shows algorithm options + Start Clustering instead of Continue (step stays on configuration until the run starts). */
+  onClusteringStart?: (runId: string) => void | Promise<void>;
 }
 
 export default function StepConfigureData({
   datasetId, dataset, columns, targetColumn, featureColumns,
   onTargetChange, onFeaturesChange, onTaskSuggest, onContinue,
-  onClusteringDetected, onBack, backLabel,
+  onClusteringDetected, onBack, backLabel, clusteringMode = false, onClusteringStart,
 }: Props) {
   const [activeTab, setActiveTab] = useState<'config' | 'preview'>('config');
+  /** Clustering: default tab shows only algorithm & search; features are on a separate tab. */
+  const [clusteringPanel, setClusteringPanel] = useState<'algorithm' | 'features'>('algorithm');
   const [useCase, setUseCase] = useState('');
   const [aiResult, setAiResult] = useState<AIRecommendResponse | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
@@ -35,13 +44,21 @@ export default function StepConfigureData({
   const [detectResult, setDetectResult] = useState<AutoDetectTaskResponse | null>(null);
   const [detecting, setDetecting] = useState(false);
 
+  const [clAlgorithm, setClAlgorithm] = useState('');
+  const [clNClusters, setClNClusters] = useState<number | undefined>(undefined);
+  const [clEps, setClEps] = useState<number | undefined>(undefined);
+  const [clMinSamples, setClMinSamples] = useState<number | undefined>(undefined);
+  const [clStability, setClStability] = useState(true);
+  const [clStarting, setClStarting] = useState(false);
+
   useEffect(() => {
+    if (clusteringMode) return;
     setSuggestionsLoading(true);
     api.suggestUseCases(datasetId)
       .then((res) => setSuggestions(res.suggestions))
       .catch(() => {})
       .finally(() => setSuggestionsLoading(false));
-  }, [datasetId]);
+  }, [datasetId, clusteringMode]);
 
   const handleAutoDetect = async () => {
     setDetecting(true);
@@ -109,29 +126,110 @@ export default function StepConfigureData({
     ? suggestions.filter((s) => s.ml_task === taskFilter)
     : [];
 
+  const numericCols = columns.filter((c) =>
+    c.dtype === 'int64' || c.dtype === 'float64' || c.dtype === 'int32' || c.dtype === 'float32'
+  );
+
+  const handleClusteringStart = async () => {
+    if (!onClusteringStart || featureColumns.length === 0) return;
+    setClStarting(true);
+    try {
+      const req: ClusteringStartRequest = {
+        dataset_id: datasetId,
+        feature_columns: featureColumns,
+        algorithm: clAlgorithm || undefined,
+        n_clusters: clNClusters,
+        eps: clAlgorithm === 'dbscan' ? clEps : undefined,
+        min_samples: clAlgorithm === 'dbscan' ? clMinSamples : undefined,
+        run_stability_check: clStability,
+      };
+      const resp = await api.startClustering(req);
+
+      // Cache hit — backend returned previous results instantly
+      if (resp.status === 'complete') {
+        // Fetch and display results directly, skipping the execution step
+        try {
+          const [result, elbow] = await Promise.all([
+            api.getClusteringResult(resp.run_id),
+            api.getElbowAnalysis(resp.run_id).catch(() => null),
+          ]);
+          // Set the result on the parent so the results step renders
+          await onClusteringStart(resp.run_id);
+          // Import: the parent's onComplete will be called when StepClustering fetches results
+        } catch {
+          // Fallback: proceed normally so polling will retry
+          await onClusteringStart(resp.run_id);
+        }
+      } else {
+        await onClusteringStart(resp.run_id);
+      }
+    } catch {
+      /* ignore */
+    } finally {
+      setClStarting(false);
+    }
+  };
+
   return (
     <div className="aw-step-content">
-      <div className="aw-step-main">
+      <div className={`aw-step-main ${clusteringMode ? 'aw-step-main--wide' : ''}`}>
         {onBack && (
           <button className="aw-back-btn" onClick={onBack}>{backLabel || '← Back to Select Dataset'}</button>
         )}
         <div className="aw-tab-bar">
-          <button
-            className={`aw-tab ${activeTab === 'config' ? 'aw-tab--active' : ''}`}
-            onClick={() => setActiveTab('config')}
-          >Column Configuration</button>
-          <button
-            className={`aw-tab ${activeTab === 'preview' ? 'aw-tab--active' : ''}`}
-            onClick={loadPreview}
-          >Dataset Preview</button>
+          {clusteringMode ? (
+            <>
+              <button
+                type="button"
+                className={`aw-tab ${activeTab === 'config' && clusteringPanel === 'algorithm' ? 'aw-tab--active' : ''}`}
+                onClick={() => { setActiveTab('config'); setClusteringPanel('algorithm'); }}
+              >Algorithm &amp; search</button>
+              <button
+                type="button"
+                className={`aw-tab ${activeTab === 'config' && clusteringPanel === 'features' ? 'aw-tab--active' : ''}`}
+                onClick={() => { setActiveTab('config'); setClusteringPanel('features'); }}
+              >Features</button>
+              <button
+                type="button"
+                className={`aw-tab ${activeTab === 'preview' ? 'aw-tab--active' : ''}`}
+                onClick={loadPreview}
+              >Dataset preview</button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                className={`aw-tab ${activeTab === 'config' ? 'aw-tab--active' : ''}`}
+                onClick={() => setActiveTab('config')}
+              >Column Configuration</button>
+              <button
+                type="button"
+                className={`aw-tab ${activeTab === 'preview' ? 'aw-tab--active' : ''}`}
+                onClick={loadPreview}
+              >Dataset Preview</button>
+            </>
+          )}
         </div>
 
         {activeTab === 'config' && (
           <>
             <div className="aw-config-header">
-              <h3>Column Configuration</h3>
-              <p>Select target variable and feature columns</p>
+              <h3>
+                {clusteringMode
+                  ? clusteringPanel === 'algorithm'
+                    ? 'Algorithm & search'
+                    : 'Feature columns'
+                  : 'Column Configuration'}
+              </h3>
+              <p>
+                {clusteringMode
+                  ? clusteringPanel === 'algorithm'
+                    ? 'Set how models are searched. Pick or adjust feature columns on the Features tab.'
+                    : 'Choose which columns to cluster on (exclude IDs and prior cluster labels).'
+                  : 'Select target variable and feature columns'}
+              </p>
             </div>
+            {(!clusteringMode || clusteringPanel === 'features') && (
             <div className="aw-columns-table">
               <div className="aw-col-header">
                 <span className="aw-col-check">Feature</span>
@@ -139,16 +237,16 @@ export default function StepConfigureData({
                 <span className="aw-col-type">Type</span>
                 <span className="aw-col-null">Nulls</span>
                 <span className="aw-col-unique">Unique</span>
-                <span className="aw-col-target">Target</span>
+                {!clusteringMode && <span className="aw-col-target">Target</span>}
               </div>
               {columns.map((col) => (
-                <div key={col.name} className={`aw-col-row ${col.name === targetColumn ? 'aw-col-row--target' : ''}`}>
+                <div key={col.name} className={`aw-col-row ${!clusteringMode && col.name === targetColumn ? 'aw-col-row--target' : ''}`}>
                   <span className="aw-col-check">
                     <input
                       type="checkbox"
                       checked={featureColumns.includes(col.name)}
                       onChange={() => handleFeatureToggle(col.name)}
-                      disabled={col.name === targetColumn}
+                      disabled={!clusteringMode && col.name === targetColumn}
                     />
                   </span>
                   <span className="aw-col-name">{col.name}</span>
@@ -159,23 +257,113 @@ export default function StepConfigureData({
                   </span>
                   <span className="aw-col-null">{col.null_count}</span>
                   <span className="aw-col-unique">{col.unique_count}</span>
-                  <span className="aw-col-target">
-                    <input
-                      type="radio"
-                      name="target"
-                      checked={col.name === targetColumn}
-                      onChange={() => {
-                        onTargetChange(col.name);
-                        onFeaturesChange(columns.filter((c) => c.name !== col.name).map((c) => c.name));
-                      }}
-                    />
-                  </span>
+                  {!clusteringMode && (
+                    <span className="aw-col-target">
+                      <input
+                        type="radio"
+                        name="target"
+                        checked={col.name === targetColumn}
+                        onChange={() => {
+                          onTargetChange(col.name);
+                          onFeaturesChange(columns.filter((c) => c.name !== col.name).map((c) => c.name));
+                        }}
+                      />
+                    </span>
+                  )}
                 </div>
               ))}
             </div>
-            <button className="aw-btn aw-btn--primary aw-btn--full" onClick={onContinue} disabled={!targetColumn}>
-              Continue →
-            </button>
+            )}
+
+            {clusteringMode && onClusteringStart && clusteringPanel === 'algorithm' && (
+              <div className="cl-config-section cl-config-section--embedded">
+                <div className="cl-config-section">
+                  <label className="cl-label">Algorithm (leave empty for Auto)</label>
+                  <select className="cl-select" value={clAlgorithm} onChange={(e) => setClAlgorithm(e.target.value)}>
+                    <option value="">Auto (try all)</option>
+                    <option value="kmeans">KMeans</option>
+                    <option value="gmm">GMM (Gaussian Mixture)</option>
+                    <option value="dbscan">DBSCAN</option>
+                  </select>
+                </div>
+                {(clAlgorithm === 'kmeans' || clAlgorithm === 'gmm' || clAlgorithm === '') && (
+                  <div className="cl-config-section">
+                    <label className="cl-label">Number of Clusters (optional, 2–20)</label>
+                    <input
+                      className="cl-input"
+                      type="number" min={2} max={20}
+                      value={clNClusters ?? ''}
+                      onChange={(e) => setClNClusters(e.target.value ? Number(e.target.value) : undefined)}
+                      placeholder="Auto (grid search 2–10)"
+                    />
+                  </div>
+                )}
+                {clAlgorithm === 'dbscan' && (
+                  <>
+                    <div className="cl-config-section">
+                      <label className="cl-label">DBSCAN eps (optional)</label>
+                      <input
+                        className="cl-input"
+                        type="number" step="0.1" min={0.01}
+                        value={clEps ?? ''}
+                        onChange={(e) => setClEps(e.target.value ? Number(e.target.value) : undefined)}
+                        placeholder="Auto grid search"
+                      />
+                    </div>
+                    <div className="cl-config-section">
+                      <label className="cl-label">DBSCAN min_samples (optional)</label>
+                      <input
+                        className="cl-input"
+                        type="number" min={1}
+                        value={clMinSamples ?? ''}
+                        onChange={(e) => setClMinSamples(e.target.value ? Number(e.target.value) : undefined)}
+                        placeholder="Auto grid search"
+                      />
+                    </div>
+                  </>
+                )}
+                <div className="cl-config-section">
+                  <label className="cl-toggle-row">
+                    <input type="checkbox" checked={clStability} onChange={(e) => setClStability(e.target.checked)} />
+                    <span>Run Stability Check (5 runs, compare ARI)</span>
+                  </label>
+                </div>
+              </div>
+            )}
+
+            {clusteringMode && onClusteringStart ? (
+              clusteringPanel === 'algorithm' ? (
+                <>
+                  <button
+                    className="aw-btn aw-btn--primary aw-btn--full"
+                    type="button"
+                    onClick={handleClusteringStart}
+                    disabled={featureColumns.length === 0 || clStarting}
+                  >
+                    {clStarting ? 'Starting…' : 'Start clustering →'}
+                  </button>
+                  <div className="cl-info-note" style={{ marginTop: 12 }}>
+                    <strong>Features selected:</strong> {featureColumns.length} columns.
+                    Numeric: {numericCols.filter((c) => featureColumns.includes(c.name)).length}. Categorical will be one-hot encoded.
+                    {featureColumns.length === 0 && (
+                      <span> Select at least one column on the <button type="button" className="cl-inline-link" onClick={() => setClusteringPanel('features')}>Features</button> tab.</span>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <p className="cl-info-note" style={{ marginTop: 12 }}>
+                  When ready, open <button type="button" className="cl-inline-link" onClick={() => setClusteringPanel('algorithm')}>Algorithm &amp; search</button> to start the run.
+                </p>
+              )
+            ) : (
+              <button
+                className="aw-btn aw-btn--primary aw-btn--full"
+                onClick={onContinue}
+                disabled={clusteringMode ? featureColumns.length === 0 : !targetColumn}
+              >
+                Continue →
+              </button>
+            )}
           </>
         )}
 
@@ -218,6 +406,7 @@ export default function StepConfigureData({
         )}
       </div>
 
+      {!clusteringMode && (
       <div className="aw-step-sidebar">
         <div className="aw-ai-panel">
           <h4>🤖 AI Assistant</h4>
@@ -350,6 +539,7 @@ export default function StepConfigureData({
           )}
         </div>
       </div>
+      )}
     </div>
   );
 }

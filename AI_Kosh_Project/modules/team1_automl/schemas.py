@@ -216,11 +216,6 @@ class ClusteringStartRequest(BaseModel):
     eps: Optional[float] = None
     min_samples: Optional[int] = None
     run_stability_check: bool = True
-    run_post_ml: bool = False
-    post_ml_target: Optional[str] = None
-    post_ml_task: Optional[str] = None
-    post_ml_max_models: int = 10
-    post_ml_max_runtime_secs: int = 180
 
 
 class ClusteringStartResponse(BaseModel):
@@ -287,8 +282,6 @@ class ClusteringResultResponse(BaseModel):
     feature_columns: list[str]
     total_candidates_tested: int
     pca_points: Optional[list[DimensionReductionPoint]] = None
-    post_ml_run_id: Optional[str] = None
-    post_ml_status: Optional[str] = None
 
 
 class ElbowDataPoint(BaseModel):
@@ -301,3 +294,26 @@ class ElbowResponse(BaseModel):
     run_id: str
     data: list[ElbowDataPoint]
     recommended_k: int
+
+
+# ── Training History Schemas (Azure persistence) ──────────────────────────
+
+class TrainingRunSummary(BaseModel):
+    run_id: str
+    dataset_id: str
+    dataset_name: str = ""
+    ml_task: str = ""
+    target_column: str = ""
+    best_model_id: str = ""
+    best_algorithm: str = ""
+    primary_metric: str = ""
+    best_metric_value: float = 0.0
+    model_count: int = 0
+    status: str = "complete"
+    run_type: str = "training"
+    created_at: str = ""
+
+
+class TrainingHistoryResponse(BaseModel):
+    runs: list[TrainingRunSummary]
+

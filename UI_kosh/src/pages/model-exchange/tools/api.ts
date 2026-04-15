@@ -2,7 +2,7 @@ import axios from 'axios';
 import type {
   DatasetMetadata, DatasetColumnsResponse, DatasetPreviewResponse,
   AIRecommendResponse, TrainingStartRequest, TrainingStartResponse,
-  TrainingStatusResponse, LeaderboardResponse, FeatureImportanceResponse,
+  TrainingStatusResponse, TrainingHistoryResponse, LeaderboardResponse, FeatureImportanceResponse,
   ConfusionMatrixResponse, ResidualsResponse, UseCaseSuggestionsResponse,
   HFDatasetInfo, AISummaryResponse, AutoDetectTaskResponse,
   ClusteringStartRequest, ClusteringStartResponse,
@@ -78,6 +78,11 @@ export const getTrainingStatus = async (runId: string): Promise<TrainingStatusRe
 
 export const stopTraining = async (runId: string): Promise<void> => {
   await api.post(`/team1/training/${runId}/stop`);
+};
+
+export const getTrainingHistory = async (): Promise<TrainingHistoryResponse> => {
+  const { data } = await api.get('/team1/training/history');
+  return data;
 };
 
 export const getLeaderboard = async (runId: string): Promise<LeaderboardResponse> => {
@@ -159,21 +164,6 @@ export const getClusteringResult = async (runId: string): Promise<ClusteringResu
 export const getElbowAnalysis = async (runId: string): Promise<ElbowResponse> => {
   const { data } = await api.get(`/team1/clustering/${runId}/elbow`);
   return data;
-};
-
-export const applyClusterLabels = async (runId: string, datasetId: string): Promise<DatasetMetadata> => {
-  const { data } = await api.post(`/team1/clustering/${runId}/apply-labels?dataset_id=${datasetId}`);
-  return data;
-};
-
-export const getClusteringWsUrl = (runId: string) => {
-  if (BASE) {
-    const wsBase = BASE.replace(/^http/, 'ws');
-    return `${wsBase}/team1/ws/clustering/${runId}`;
-  }
-  const host = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
-  const port = import.meta.env.VITE_BACKEND_PORT || DEFAULT_BACKEND_PORT;
-  return `ws://${host}:${port}/team1/ws/clustering/${runId}`;
 };
 
 export const getWsUrl = (runId: string) => {

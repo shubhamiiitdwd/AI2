@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import './Dashboard.css';
+import { listDatasets, getTrainingHistory } from './tools/api';
 
 interface Props {
   onStartProject: () => void;
@@ -18,20 +19,33 @@ export default function Dashboard({ onStartProject }: Props) {
     { id: '1', title: 'Extraction', tags: ['ocr', 'automl'], time: 'Just now' },
   ]);
 
-  useEffect(() => {
-    // Fetch dataset count from backend
-    fetch(
-      (import.meta.env.VITE_API_URL ||
-        (import.meta.env.DEV
-          ? ''
-          : `http://localhost:${import.meta.env.VITE_BACKEND_PORT || '8099'}`)) + '/team1/datasets'
-    )
-      .then(r => r.json())
-      .then((data: unknown[]) => {
-        setStats(prev => ({ ...prev, datasets: data.length }));
-      })
-      .catch(() => {});
+  const loadStats = useCallback(async () => {
+    try {
+      const [datasets, history] = await Promise.all([
+        listDatasets(),
+        getTrainingHistory().catch(() => ({ runs: [] })),
+      ]);
+      const trainingRuns = history.runs.filter(r => r.run_type === 'training');
+      const models = trainingRuns.reduce((acc, r) => acc + (r.model_count || 0), 0);
+      const sessions = trainingRuns.length;
+      // Same rule as Results: 100% when the pipeline completed with models; 0% if nothing succeeded yet.
+      const successPct = sessions > 0 && models > 0 ? 100 : 0;
+      setStats({
+        models,
+        sessions,
+        datasets: datasets.length,
+        success: successPct.toFixed(1),
+      });
+    } catch {
+      /* keep previous stats */
+    }
   }, []);
+
+  useEffect(() => {
+    void loadStats();
+    const t = window.setInterval(() => void loadStats(), 25000);
+    return () => window.clearInterval(t);
+  }, [loadStats]);
 
   return (
     <div className="mx-page">
@@ -80,7 +94,7 @@ export default function Dashboard({ onStartProject }: Props) {
             <span className="mx-stat-value">{stats.models}</span>
             <svg className="mx-stat-spark" viewBox="0 0 60 24"><polyline points="0,20 10,16 20,18 30,10 40,14 50,8 60,12" fill="none" stroke="#e67e22" strokeWidth="2"/></svg>
           </div>
-          <div className="mx-stat-change mx-stat-change--down">-100.0% since 24h</div>
+          <div className="mx-stat-footnote">All time · from AutoML runs</div>
         </div>
         <div className="mx-stat-card">
           <div className="mx-stat-label">Training Sessions</div>
@@ -88,7 +102,7 @@ export default function Dashboard({ onStartProject }: Props) {
             <span className="mx-stat-value">{stats.sessions}</span>
             <svg className="mx-stat-spark" viewBox="0 0 60 24"><polyline points="0,18 10,12 20,16 30,8 40,14 50,10 60,6" fill="none" stroke="#e67e22" strokeWidth="2"/></svg>
           </div>
-          <div className="mx-stat-change mx-stat-change--down">-100.0% since 24h</div>
+          <div className="mx-stat-footnote">All time · completed sessions</div>
         </div>
         <div className="mx-stat-card">
           <div className="mx-stat-label">Datasets Processed</div>
@@ -96,7 +110,7 @@ export default function Dashboard({ onStartProject }: Props) {
             <span className="mx-stat-value">{stats.datasets}</span>
             <svg className="mx-stat-spark" viewBox="0 0 60 24"><polyline points="0,20 10,14 20,18 30,6 40,16 50,10 60,8" fill="none" stroke="#e67e22" strokeWidth="2"/></svg>
           </div>
-          <div className="mx-stat-change mx-stat-change--down">-100.0% since 24h</div>
+          <div className="mx-stat-footnote">All time · uploaded datasets</div>
         </div>
         <div className="mx-stat-card">
           <div className="mx-stat-label">Success Rate</div>
@@ -104,7 +118,7 @@ export default function Dashboard({ onStartProject }: Props) {
             <span className="mx-stat-value">{stats.success}%</span>
             <svg className="mx-stat-spark" viewBox="0 0 60 24"><polyline points="0,16 10,18 20,14 30,12 40,18 50,8 60,16" fill="none" stroke="#e67e22" strokeWidth="2"/></svg>
           </div>
-          <div className="mx-stat-change mx-stat-change--down">-59.3% since 24h</div>
+          <div className="mx-stat-footnote">100% when at least one run finished with models</div>
         </div>
       </section>
 

@@ -14,6 +14,7 @@ from .schemas import (
     HFDatasetInfo, HFImportRequest,
     ClusteringStartRequest, ClusteringStartResponse,
     ClusteringResultResponse, ElbowResponse,
+    TrainingHistoryResponse,
 )
 from . import services
 from . import hf_datasets
@@ -87,6 +88,17 @@ async def validate_config(req: ValidateConfigRequest):
 @router.post("/training/start", response_model=TrainingStartResponse)
 async def start_training(req: TrainingStartRequest):
     return await services.start_training(req)
+
+
+# History routes must come before {run_id} wildcard routes
+@router.get("/training/history", response_model=TrainingHistoryResponse)
+async def list_training_history():
+    return await services.list_training_history()
+
+
+@router.get("/training/history/{dataset_id}", response_model=TrainingHistoryResponse)
+async def get_dataset_training_history(dataset_id: str):
+    return await services.get_dataset_training_history(dataset_id)
 
 
 @router.get("/training/{run_id}/status", response_model=TrainingStatusResponse)
@@ -178,11 +190,13 @@ async def clustering_elbow(run_id: str):
     return await services.get_elbow_analysis(run_id)
 
 
-@router.post("/clustering/{run_id}/apply-labels", response_model=DatasetMetadata)
-async def apply_cluster_labels(run_id: str, dataset_id: str):
-    return await services.apply_cluster_labels(run_id, dataset_id)
-
-
 @router.websocket("/ws/clustering/{run_id}")
 async def clustering_ws(websocket: WebSocket, run_id: str):
     await services.clustering_websocket(websocket, run_id)
+
+
+# ── Load Persisted Results ─────────────────────────────────────────────────
+
+@router.post("/results/{run_id}/load")
+async def load_persisted_result(run_id: str):
+    return await services.load_persisted_result(run_id)

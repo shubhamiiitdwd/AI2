@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { isAxiosError } from 'axios';
 import {
   ScatterChart, Scatter, XAxis, YAxis, Tooltip, CartesianGrid,
   ResponsiveContainer, BarChart, Bar, Cell, LineChart, Line,
@@ -6,7 +7,7 @@ import {
 } from 'recharts';
 import * as api from '../api';
 import type {
-  ClusteringResultResponse, ClusteringStartRequest, ElbowResponse,
+  ClusteringResultResponse, ElbowResponse,
   ColumnInfo,
 } from '../types';
 
@@ -20,12 +21,17 @@ interface Props {
   featureColumns: string[];
   columns: ColumnInfo[];
   onComplete: (result: ClusteringResultResponse) => void;
-  onContinueToSupervisedML?: () => void;
   onBack?: () => void;
-  existingResult?: ClusteringResultResponse | null;
+  /** Live run + logs vs full results dashboard (parent wizard steps 2 vs 3). */
+  wizardView: 'execution' | 'results';
+  /** Set when the run is started from Clustering configuration; progress via HTTP polling. */
+  runId: string | null;
+  /** Filled after the run completes; used when wizardView is results. */
+  clusteringResult: ClusteringResultResponse | null;
+  onViewResults: () => void;
+  /** From results: go back to logs (parent sets wizard step to model search). */
+  onBackToLogs: () => void;
 }
-
-type Phase = 'config' | 'running' | 'done' | 'results';
 
 interface ConfigUsed {
   algorithm: string;
@@ -35,33 +41,74 @@ interface ConfigUsed {
   stability: boolean;
 }
 
-export default function StepClustering({ datasetId, featureColumns, columns, onComplete, onContinueToSupervisedML, onBack, existingResult }: Props) {
-  const [phase, setPhase] = useState<Phase>(existingResult ? 'results' : 'config');
-  const [algorithm, setAlgorithm] = useState<string>('');
-  const [nClusters, setNClusters] = useState<number | undefined>(undefined);
-  const [eps, setEps] = useState<number | undefined>(undefined);
-  const [minSamples, setMinSamples] = useState<number | undefined>(undefined);
-  const [runStability, setRunStability] = useState(true);
+type ExecutionPhase = 'running' | 'done';
 
-  const [runId, setRunId] = useState<string | null>(null);
+export default function StepClustering({
+  datasetId,
+  featureColumns,
+  columns,
+  onComplete,
+  onBack,
+  wizardView,
+  runId,
+  clusteringResult: clusteringResultProp,
+  onViewResults,
+  onBackToLogs,
+}: Props) {
+  const [executionPhase, setExecutionPhase] = useState<ExecutionPhase>('running');
   const [progress, setProgress] = useState(0);
   const [logMessages, setLogMessages] = useState<string[]>([]);
   const [configUsed, setConfigUsed] = useState<ConfigUsed | null>(null);
 
-  const [result, setResult] = useState<ClusteringResultResponse | null>(existingResult || null);
+  const [fetchedResult, setFetchedResult] = useState<ClusteringResultResponse | null>(clusteringResultProp);
   const [elbow, setElbow] = useState<ElbowResponse | null>(null);
 
+  const importanceChartData = useMemo(() => {
+    const src = clusteringResultProp ?? fetchedResult;
+    if (!src?.feature_importance?.length) return [];
+    const raw = src.feature_importance.map((f) => ({
+      feature: f.feature,
+      importance: Math.max(0, Number(f.importance) || 0),
+    }));
+    const max = Math.max(...raw.map((r) => r.importance), 1e-12);
+    return raw.map((r) => ({
+      ...r,
+      importancePct: (r.importance / max) * 100,
+    }));
+  }, [clusteringResultProp, fetchedResult]);
+
   useEffect(() => {
-    if (existingResult && !elbow) {
-      api.getElbowAnalysis(existingResult.run_id).then(setElbow).catch(() => {});
+    setFetchedResult(clusteringResultProp);
+  }, [clusteringResultProp]);
+
+  useEffect(() => {
+    const rid = clusteringResultProp?.run_id;
+    if (rid && !elbow) {
+      api.getElbowAnalysis(rid).then(setElbow).catch(() => {});
     }
-  }, [existingResult]);
+  }, [clusteringResultProp, elbow]);
+
+  useEffect(() => {
+    if (wizardView === 'execution' && clusteringResultProp) {
+      setExecutionPhase('done');
+    }
+  }, [wizardView, clusteringResultProp]);
   const [activeTab, setActiveTab] = useState<'overview' | 'scatter' | 'leaderboard' | 'elbow' | 'importance'>('overview');
+  /** Overview pie: visual scale (radius). Scatter: domain zoom (1 = full data range). */
+  const [pieVisualZoom, setPieVisualZoom] = useState(1);
+  const [scatterDomainZoom, setScatterDomainZoom] = useState(1);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const retryCountRef = useRef(0);
 
-  const wsRef = useRef<WebSocket | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const progressRef = useRef(0);
   const logEndRef = useRef<HTMLDivElement>(null);
+  /** Avoid resetting log lines when the tracking effect re-runs for the same run (e.g. step 2 ↔ 3). */
+  const trackingRunIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    progressRef.current = progress;
+  }, [progress]);
 
   const scrollToLogEnd = useCallback(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -69,190 +116,139 @@ export default function StepClustering({ datasetId, featureColumns, columns, onC
 
   useEffect(scrollToLogEnd, [logMessages, scrollToLogEnd]);
 
-  const handleStart = async () => {
-    setPhase('running');
-    setLogMessages([]);
-    setProgress(0);
-    setConfigUsed({
-      algorithm: algorithm || 'auto',
-      nClusters,
-      eps: algorithm === 'dbscan' ? eps : undefined,
-      minSamples: algorithm === 'dbscan' ? minSamples : undefined,
-      stability: runStability,
-    });
+  const clusteringFetchDoneRef = useRef<string | null>(null);
+  const clusteringFetchInFlightRef = useRef(false);
 
-    try {
-      const req: ClusteringStartRequest = {
-        dataset_id: datasetId,
-        feature_columns: featureColumns,
-        algorithm: algorithm || undefined,
-        n_clusters: nClusters,
-        eps: algorithm === 'dbscan' ? eps : undefined,
-        min_samples: algorithm === 'dbscan' ? minSamples : undefined,
-        run_stability_check: runStability,
-      };
-      const resp = await api.startClustering(req);
-      setRunId(resp.run_id);
-      connectWs(resp.run_id);
-    } catch (e) {
-      setLogMessages((prev) => [...prev, `Error: ${e}`]);
-      setPhase('config');
-    }
-  };
-
-  const connectWs = (rid: string) => {
-    const url = api.getClusteringWsUrl(rid);
-    const ws = new WebSocket(url);
-    wsRef.current = ws;
-
-    ws.onmessage = (evt) => {
-      try {
-        const msg = JSON.parse(evt.data);
-        if (msg.progress !== undefined) setProgress(msg.progress);
-        if (msg.message) {
-          const ts = msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString() : '';
-          setLogMessages((prev) => [...prev, `[${ts}] ${msg.message}`]);
-        }
-        if (msg.progress === 100) {
-          fetchResults(rid);
-        }
-      } catch { /* ignore */ }
-    };
-
-    ws.onerror = () => {
-      setLogMessages((prev) => [...prev, '[WS] Connection error']);
-    };
-    ws.onclose = () => {
-      if (progress < 100) {
-        setTimeout(() => fetchResults(rid), 2000);
-      }
-    };
-  };
-
-  const fetchResults = async (rid: string) => {
+  const fetchResults = useCallback(async (rid: string) => {
+    if (clusteringFetchDoneRef.current === rid) return;
+    if (clusteringFetchInFlightRef.current) return;
+    clusteringFetchInFlightRef.current = true;
     setFetchError(null);
     try {
       const [res, elb] = await Promise.all([
         api.getClusteringResult(rid),
         api.getElbowAnalysis(rid),
       ]);
+      clusteringFetchDoneRef.current = rid;
       retryCountRef.current = 0;
-      setResult(res);
+      setFetchedResult(res);
       setElbow(elb);
-      setPhase('done');
+      setExecutionPhase('done');
       onComplete(res);
     } catch (err) {
+      const is404 = isAxiosError(err) && err.response?.status === 404;
+      // 404 = result/elbow not available yet (race right after 100%) or run unknown. Retry a few times for races only.
       retryCountRef.current += 1;
-      if (retryCountRef.current < 5) {
-        setTimeout(() => fetchResults(rid), 3000);
+      const maxRetries = is404 ? 10 : 4;
+      const delayMs = is404 ? 2000 : 3000;
+      if (retryCountRef.current < maxRetries) {
+        setTimeout(() => { fetchResults(rid); }, delayMs);
       } else {
         setFetchError(
           'Could not load clustering results. The backend may have restarted and lost the in-memory results. Please re-run clustering.'
         );
       }
+    } finally {
+      clusteringFetchInFlightRef.current = false;
     }
-  };
+  }, [onComplete]);
 
-  useEffect(() => {
-    return () => { wsRef.current?.close(); };
-  }, []);
-
-  const numericCols = columns.filter((c) =>
-    c.dtype === 'int64' || c.dtype === 'float64' || c.dtype === 'int32' || c.dtype === 'float32'
+  /** Always poll HTTP status so logs work even when WebSocket fails (proxy, Strict Mode remount, etc.). */
+  const startHttpPolling = useCallback(
+    (rid: string) => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+      pollRef.current = setInterval(async () => {
+        try {
+          const st = await api.getClusteringStatus(rid);
+          const pct = st.progress_percent ?? 0;
+          progressRef.current = pct;
+          setProgress(pct);
+          if (st.message) {
+            const line = `[status] ${st.message}`;
+            setLogMessages((prev) => (prev[prev.length - 1] === line ? prev : [...prev, line]));
+          }
+          if (pct >= 100) {
+            if (pollRef.current) {
+              clearInterval(pollRef.current);
+              pollRef.current = null;
+            }
+            fetchResults(rid);
+          }
+        } catch {
+          /* run may not be registered for a tick right after start */
+        }
+      }, 1200);
+    },
+    [fetchResults],
   );
 
-  // ── CONFIG PHASE ──
-  if (phase === 'config') {
-    return (
-      <div className="aw-step-content">
-        <div className="aw-step-main">
-          {onBack && (
-            <button className="aw-back-btn" onClick={onBack}>← Back to Configure Data</button>
-          )}
-          <h3 className="aw-section-title">Clustering Configuration</h3>
+  const clusteringResultRunId = clusteringResultProp?.run_id ?? null;
 
-          <div className="cl-config-section">
-            <label className="cl-label">Algorithm (leave empty for Auto)</label>
-            <select className="cl-select" value={algorithm} onChange={(e) => setAlgorithm(e.target.value)}>
-              <option value="">Auto (try all)</option>
-              <option value="kmeans">KMeans</option>
-              <option value="gmm">GMM (Gaussian Mixture)</option>
-              <option value="dbscan">DBSCAN</option>
-            </select>
-          </div>
+  useEffect(() => {
+    if (!runId) return;
+    if (wizardView !== 'execution') return;
 
-          {(algorithm === 'kmeans' || algorithm === 'gmm' || algorithm === '') && (
-            <div className="cl-config-section">
-              <label className="cl-label">Number of Clusters (optional, 2-20)</label>
-              <input
-                className="cl-input"
-                type="number" min={2} max={20}
-                value={nClusters ?? ''}
-                onChange={(e) => setNClusters(e.target.value ? Number(e.target.value) : undefined)}
-                placeholder="Auto (grid search 2-10)"
-              />
-            </div>
-          )}
+    if (clusteringResultRunId === runId && clusteringResultProp) {
+      setExecutionPhase('done');
+      setFetchedResult(clusteringResultProp);
+      setProgress(100);
+      progressRef.current = 100;
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+      return;
+    }
 
-          {algorithm === 'dbscan' && (
-            <>
-              <div className="cl-config-section">
-                <label className="cl-label">DBSCAN eps (optional)</label>
-                <input
-                  className="cl-input"
-                  type="number" step="0.1" min={0.01}
-                  value={eps ?? ''}
-                  onChange={(e) => setEps(e.target.value ? Number(e.target.value) : undefined)}
-                  placeholder="Auto grid search"
-                />
-              </div>
-              <div className="cl-config-section">
-                <label className="cl-label">DBSCAN min_samples (optional)</label>
-                <input
-                  className="cl-input"
-                  type="number" min={1}
-                  value={minSamples ?? ''}
-                  onChange={(e) => setMinSamples(e.target.value ? Number(e.target.value) : undefined)}
-                  placeholder="Auto grid search"
-                />
-              </div>
-            </>
-          )}
+    const isNewRun = trackingRunIdRef.current !== runId;
+    if (isNewRun) {
+      trackingRunIdRef.current = runId;
+      setExecutionPhase('running');
+      setLogMessages(['[status] Tracking job (HTTP polling).']);
+      setProgress(0);
+      progressRef.current = 0;
+      setFetchError(null);
+      clusteringFetchDoneRef.current = null;
+      retryCountRef.current = 0;
+    }
 
-          <div className="cl-config-section">
-            <label className="cl-toggle-row">
-              <input type="checkbox" checked={runStability} onChange={(e) => setRunStability(e.target.checked)} />
-              <span>Run Stability Check (5 runs, compare ARI)</span>
-            </label>
-          </div>
+    startHttpPolling(runId);
 
-          <button className="aw-btn aw-btn--primary aw-btn--full" onClick={handleStart}>
-            Start Clustering →
-          </button>
+    return () => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+    };
+  }, [wizardView, runId, clusteringResultRunId, clusteringResultProp, startHttpPolling]);
 
-          <div className="cl-info-note">
-            <strong>Features selected:</strong> {featureColumns.length} columns.
-            Numeric: {numericCols.length}. Categorical will be one-hot encoded.
-          </div>
-        </div>
+  const displayResult = clusteringResultProp ?? fetchedResult;
 
-        <div className="aw-step-sidebar">
-          <h4>Clustering Pipeline:</h4>
-          <ul className="aw-workflow-list">
-            <li className="aw-workflow-active">Configure algorithm & params</li>
-            <li>Scale & encode features</li>
-            <li>Grid search all candidates</li>
-            <li>Score & rank models</li>
-            <li>Stability check</li>
-            <li>View results & visualizations</li>
-          </ul>
-        </div>
-      </div>
-    );
-  }
+  const pcaScatterDomains = useMemo(() => {
+    const pts = displayResult?.pca_points;
+    if (!pts?.length) return null;
+    const xs = pts.map((p) => p.x);
+    const ys = pts.map((p) => p.y);
+    const xMin = Math.min(...xs);
+    const xMax = Math.max(...xs);
+    const yMin = Math.min(...ys);
+    const yMax = Math.max(...ys);
+    const xMid = (xMin + xMax) / 2;
+    const yMid = (yMin + yMax) / 2;
+    const xHalf = Math.max(xMax - xMin, 1e-9) / 2;
+    const yHalf = Math.max(yMax - yMin, 1e-9) / 2;
+    const z = Math.max(0.35, Math.min(4, scatterDomainZoom));
+    return {
+      x: [xMid - xHalf / z, xMid + xHalf / z] as [number, number],
+      y: [yMid - yHalf / z, yMid + yHalf / z] as [number, number],
+    };
+  }, [displayResult?.pca_points, scatterDomainZoom]);
 
-  // ── RUNNING PHASE ──
-  if (phase === 'running') {
+  // ── EXECUTION: RUNNING ──
+  if (wizardView === 'execution' && executionPhase === 'running') {
     return (
       <div className="aw-step-content">
         <div className="aw-step-main">
@@ -296,7 +292,10 @@ export default function StepClustering({ datasetId, featureColumns, columns, onC
                 </button>
                 <button
                   className="aw-btn aw-btn--outline"
-                  onClick={() => { setPhase('config'); setFetchError(null); setProgress(0); }}
+                  onClick={() => {
+                    setFetchError(null);
+                    onBack?.();
+                  }}
                 >
                   Re-run Clustering
                 </button>
@@ -305,22 +304,16 @@ export default function StepClustering({ datasetId, featureColumns, columns, onC
           )}
         </div>
 
-        <div className="aw-step-sidebar">
-          <h4>Clustering Pipeline:</h4>
-          <ul className="aw-workflow-list">
-            <li>Configure algorithm & params</li>
-            <li className="aw-workflow-active">Training & evaluating models...</li>
-            <li>Score & rank models</li>
-            <li>Stability check</li>
-            <li>View results & visualizations</li>
-          </ul>
-        </div>
+        <aside className="aw-step-sidebar cl-exec-sidebar">
+          <h4>Training log</h4>
+          <p className="cl-exec-sidebar-note">Live messages from the clustering job. When progress reaches 100%, load the result payload or open the results step.</p>
+        </aside>
       </div>
     );
   }
 
-  // ── DONE PHASE (clustering finished, user reviews logs before viewing results) ──
-  if (phase === 'done') {
+  // ── EXECUTION: DONE (logs + open results) ──
+  if (wizardView === 'execution' && executionPhase === 'done') {
     return (
       <div className="aw-step-content">
         <div className="aw-step-main">
@@ -333,7 +326,7 @@ export default function StepClustering({ datasetId, featureColumns, columns, onC
 
           <div style={{ marginBottom: 16 }}>
             <div className="aw-review-banner">
-              <span>Clustering finished successfully. {result?.total_candidates_tested} model configurations tested.</span>
+              <span>Clustering finished successfully. {displayResult?.total_candidates_tested} model configurations tested.</span>
             </div>
           </div>
 
@@ -347,30 +340,29 @@ export default function StepClustering({ datasetId, featureColumns, columns, onC
           <button
             className="aw-btn aw-btn--primary aw-btn--full"
             style={{ marginTop: 16 }}
-            onClick={() => setPhase('results')}
+            onClick={onViewResults}
           >
             View Clustering Results →
           </button>
         </div>
 
-        <div className="aw-step-sidebar">
-          <h4>Clustering Pipeline:</h4>
-          <ul className="aw-workflow-list">
-            <li>Configure algorithm & params</li>
-            <li>Scale & encode features</li>
-            <li>Grid search all candidates</li>
-            <li>Score & rank models</li>
-            <li>Stability check</li>
-            <li className="aw-workflow-active">View results & visualizations</li>
-          </ul>
-        </div>
+        <aside className="aw-step-sidebar cl-exec-sidebar">
+          <h4>Training log</h4>
+          <p className="cl-exec-sidebar-note">Review the run output above, then open the results dashboard.</p>
+        </aside>
       </div>
     );
   }
 
-  // ── RESULTS PHASE ──
-  if (!result) return <div className="aw-loading">Loading results...</div>;
+  // ── RESULTS DASHBOARD (wizard step: Clustering results) ──
+  if (wizardView === 'execution') {
+    return <div className="aw-loading">Starting…</div>;
+  }
+  if (!displayResult) {
+    return <div className="aw-loading">Loading results…</div>;
+  }
 
+  const result = displayResult;
   const bestMetrics = result.best_metrics;
   const pieData = result.cluster_summaries.map((s) => ({
     name: `Cluster ${s.cluster_id}`,
@@ -379,8 +371,9 @@ export default function StepClustering({ datasetId, featureColumns, columns, onC
   }));
 
   return (
-    <div className="aw-step-content cl-results-page">
-      <div className="aw-step-main cl-results-main">
+    <div className="aw-step-content cl-results-page cl-results-page--grid">
+      <div className="cl-results-top">
+        <div className="aw-step-main cl-results-main">
         <h3 className="aw-section-title">Clustering Results</h3>
 
         {/* Best model banner */}
@@ -421,12 +414,9 @@ export default function StepClustering({ datasetId, featureColumns, columns, onC
           )}
         </div>
 
-        {/* Navigation */}
-        {logMessages.length > 0 && (
-          <button className="aw-back-btn" style={{ marginBottom: 12 }} onClick={() => setPhase('done')}>
-            ← Back to Logs
-          </button>
-        )}
+        <button className="aw-back-btn" style={{ marginBottom: 12 }} type="button" onClick={onBackToLogs}>
+          ← Back to model search &amp; logs
+        </button>
 
         {/* Tabs */}
         <div className="cl-tabs">
@@ -450,24 +440,68 @@ export default function StepClustering({ datasetId, featureColumns, columns, onC
           <div className="cl-overview">
             <div className="cl-overview-grid">
               <div className="cl-overview-card">
-                <h4>Cluster Distribution</h4>
-                <ResponsiveContainer width="100%" height={250}>
-                  <PieChart>
-                    <Pie
-                      data={pieData}
-                      dataKey="value"
-                      nameKey="name"
-                      cx="50%" cy="50%"
-                      outerRadius={90}
-                      label={({ name, percentage }) => `${name} (${percentage}%)`}
+                <div className="cl-chart-zoom-header">
+                  <h4>Cluster distribution</h4>
+                  <div className="cl-chart-zoom-controls" aria-label="Chart zoom">
+                    <button
+                      type="button"
+                      className="cl-chart-zoom-btn"
+                      onClick={() => setPieVisualZoom((z) => Math.min(2.2, z + 0.2))}
                     >
-                      {pieData.map((_entry, index) => (
-                        <Cell key={index} fill={CLUSTER_COLORS[index % CLUSTER_COLORS.length]} />
-                      ))}
-                    </Pie>
-                    <Tooltip />
-                  </PieChart>
-                </ResponsiveContainer>
+                      +
+                    </button>
+                    <button
+                      type="button"
+                      className="cl-chart-zoom-btn"
+                      onClick={() => setPieVisualZoom((z) => Math.max(0.65, z - 0.2))}
+                    >
+                      −
+                    </button>
+                    <span className="cl-chart-zoom-readout">{Math.round(pieVisualZoom * 100)}%</span>
+                  </div>
+                </div>
+                <div className="cl-chart-zoom-viewport">
+                  <ResponsiveContainer width="100%" height={Math.min(460, 210 * pieVisualZoom)}>
+                    <PieChart margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
+                      <Pie
+                        data={pieData}
+                        dataKey="value"
+                        nameKey="name"
+                        cx="36%"
+                        cy="50%"
+                        innerRadius={0}
+                        outerRadius={78 * pieVisualZoom}
+                        paddingAngle={1}
+                        label={false}
+                        labelLine={false}
+                      >
+                        {pieData.map((_entry, index) => (
+                          <Cell key={index} fill={CLUSTER_COLORS[index % CLUSTER_COLORS.length]} />
+                        ))}
+                      </Pie>
+                      <Tooltip
+                        formatter={(value: number, _name: string, item) => [
+                          `${value} rows`,
+                          (item?.payload as { name?: string })?.name ?? '',
+                        ]}
+                      />
+                      <Legend
+                        verticalAlign="middle"
+                        align="right"
+                        layout="vertical"
+                        wrapperStyle={{ fontSize: 15, lineHeight: 1.6, paddingLeft: 8 }}
+                        formatter={(value, entry) => {
+                          const p = entry.payload as { percentage?: number; name?: string };
+                          return (
+                            <span className="cl-legend-cluster">
+                              {p?.name ?? value} — {p?.percentage ?? '—'}%
+                            </span>
+                          );
+                        }}
+                      />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
               </div>
 
               <div className="cl-overview-card">
@@ -503,35 +537,70 @@ export default function StepClustering({ datasetId, featureColumns, columns, onC
               )}
             </div>
 
-            {onContinueToSupervisedML && (
-              <button className="aw-btn aw-btn--primary aw-btn--full" style={{ marginTop: 16 }} onClick={onContinueToSupervisedML}>
-                Continue to Supervised ML (with cluster labels) →
-              </button>
-            )}
           </div>
         )}
 
         {/* Scatter plot tab */}
-        {activeTab === 'scatter' && result.pca_points && (
+        {activeTab === 'scatter' && result.pca_points && pcaScatterDomains && (
           <div className="cl-scatter-container">
-            <h4>PCA 2D Projection</h4>
-            <ResponsiveContainer width="100%" height={400}>
-              <ScatterChart>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="x" name="PC1" type="number" />
-                <YAxis dataKey="y" name="PC2" type="number" />
-                <Tooltip cursor={{ strokeDasharray: '3 3' }} />
-                <Legend />
-                {Array.from(new Set(result.pca_points.map((p) => p.cluster))).sort().map((cid) => (
-                  <Scatter
-                    key={cid}
-                    name={cid === -1 ? 'Noise' : `Cluster ${cid}`}
-                    data={result.pca_points!.filter((p) => p.cluster === cid)}
-                    fill={cid === -1 ? '#999' : CLUSTER_COLORS[cid % CLUSTER_COLORS.length]}
+            <div className="cl-chart-zoom-header">
+              <h4>PCA 2D projection</h4>
+              <div className="cl-chart-zoom-controls" aria-label="Plot zoom">
+                <button
+                  type="button"
+                  className="cl-chart-zoom-btn"
+                  onClick={() => setScatterDomainZoom((z) => Math.min(4, z * 1.2))}
+                >
+                  Zoom in
+                </button>
+                <button
+                  type="button"
+                  className="cl-chart-zoom-btn"
+                  onClick={() => setScatterDomainZoom((z) => Math.max(0.35, z / 1.2))}
+                >
+                  Zoom out
+                </button>
+                <button type="button" className="cl-chart-zoom-btn" onClick={() => setScatterDomainZoom(1)}>
+                  Reset
+                </button>
+                <span className="cl-chart-zoom-readout">{Math.round(scatterDomainZoom * 100)}%</span>
+              </div>
+            </div>
+            <div className="cl-chart-zoom-viewport cl-chart-zoom-viewport--scatter">
+              <ResponsiveContainer width="100%" height={440}>
+                <ScatterChart margin={{ top: 16, right: 16, bottom: 16, left: 16 }}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis
+                    dataKey="x"
+                    name="PC1"
+                    type="number"
+                    domain={pcaScatterDomains.x}
+                    allowDataOverflow
+                    tick={{ fontSize: 13 }}
+                    label={{ value: 'PC1', position: 'insideBottom', offset: -4, style: { fontSize: 13 } }}
                   />
-                ))}
-              </ScatterChart>
-            </ResponsiveContainer>
+                  <YAxis
+                    dataKey="y"
+                    name="PC2"
+                    type="number"
+                    domain={pcaScatterDomains.y}
+                    allowDataOverflow
+                    tick={{ fontSize: 13 }}
+                    label={{ value: 'PC2', angle: -90, position: 'insideLeft', style: { fontSize: 13 } }}
+                  />
+                  <Tooltip cursor={{ strokeDasharray: '3 3' }} />
+                  <Legend wrapperStyle={{ fontSize: 14, paddingTop: 12 }} />
+                  {Array.from(new Set(result.pca_points.map((p) => p.cluster))).sort().map((cid) => (
+                    <Scatter
+                      key={cid}
+                      name={cid === -1 ? 'Noise' : `Cluster ${cid}`}
+                      data={result.pca_points!.filter((p) => p.cluster === cid)}
+                      fill={cid === -1 ? '#999' : CLUSTER_COLORS[cid % CLUSTER_COLORS.length]}
+                    />
+                  ))}
+                </ScatterChart>
+              </ResponsiveContainer>
+            </div>
           </div>
         )}
 
@@ -575,7 +644,13 @@ export default function StepClustering({ datasetId, featureColumns, columns, onC
         {activeTab === 'elbow' && elbow && (
           <div className="cl-elbow-container">
             <h4>Elbow Analysis (KMeans)</h4>
-            <p className="cl-elbow-hint">Recommended K = <strong>{elbow.recommended_k}</strong> (highest silhouette)</p>
+            <p className="cl-elbow-hint">
+              Heuristic K = <strong>{elbow.recommended_k}</strong> (best silhouette among KMeans fits for K = 2…10 only).
+            </p>
+            <p className="cl-elbow-explainer">
+              The <strong>leaderboard</strong> picks the best model by a combined score across <em>all</em> algorithms (KMeans, GMM, DBSCAN) and hyperparameters (e.g. K=6 can beat K=5).
+              The elbow chart is only a <em>KMeans-only</em> guide. So silhouette can peak at K=5 here while the global best model uses K=6 — that is expected, not a bug.
+            </p>
             <div className="cl-elbow-charts">
               <div className="cl-elbow-chart">
                 <h5>Inertia vs K</h5>
@@ -612,29 +687,61 @@ export default function StepClustering({ datasetId, featureColumns, columns, onC
           </div>
         )}
 
-        {/* Feature importance tab */}
+        {/* Feature importance tab — ANOVA F-ratio share per numeric feature (vs. cluster id as class) */}
         {activeTab === 'importance' && (
           <div className="cl-importance-container">
-            <h4>Feature Importance for Clustering</h4>
-            {result.feature_importance.length > 0 ? (
-              <ResponsiveContainer width="100%" height={Math.max(250, result.feature_importance.length * 35)}>
-                <BarChart data={result.feature_importance} layout="vertical">
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis type="number" />
-                  <YAxis dataKey="feature" type="category" width={150} />
-                  <Tooltip />
-                  <Bar dataKey="importance" fill="#6366f1" />
-                </BarChart>
-              </ResponsiveContainer>
+            <h4>Feature importance (ANOVA F-score share)</h4>
+            <p className="cl-importance-hint">
+              Higher bars mean the feature varies more across clusters (numeric columns only).
+            </p>
+            {importanceChartData.length > 0 ? (
+              <>
+                <ResponsiveContainer width="100%" height={Math.max(280, importanceChartData.length * 40)}>
+                  <BarChart
+                    data={importanceChartData}
+                    layout="vertical"
+                    margin={{ top: 8, right: 24, left: 8, bottom: 8 }}
+                  >
+                    <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+                    <XAxis type="number" domain={[0, 100]} tickFormatter={(v) => `${v}%`} />
+                    <YAxis
+                      dataKey="feature"
+                      type="category"
+                      width={Math.min(200, 28 + Math.max(...importanceChartData.map((d) => String(d.feature).length)) * 7)}
+                      tick={{ fontSize: 12 }}
+                    />
+                    <Tooltip
+                      formatter={(value: number | string) => [`${Number(value).toFixed(1)}% (relative)`, 'Importance']}
+                    />
+                    <Bar dataKey="importancePct" fill="#6366f1" radius={[0, 4, 4, 0]} maxBarSize={28} isAnimationActive={false} />
+                  </BarChart>
+                </ResponsiveContainer>
+                <table className="cl-importance-table">
+                  <thead>
+                    <tr>
+                      <th>Feature</th>
+                      <th>Share</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {importanceChartData.map((row) => (
+                      <tr key={row.feature}>
+                        <td>{row.feature}</td>
+                        <td>{(row.importance * 100).toFixed(2)}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </>
             ) : (
-              <p className="cl-no-data">No feature importance data available (may require numeric features).</p>
+              <p className="cl-no-data">No feature importance available — need at least two clusters and one numeric feature column.</p>
             )}
           </div>
         )}
 
-      </div>
+        </div>
 
-      <div className="aw-step-sidebar">
+      <aside className="aw-step-sidebar cl-results-sidebar">
         <h4>Configuration Used</h4>
         <div className="cl-config-review">
           {configUsed ? (
@@ -695,15 +802,8 @@ export default function StepClustering({ datasetId, featureColumns, columns, onC
           </div>
         </div>
 
-        <h4 style={{ marginTop: 20 }}>Clustering Pipeline:</h4>
-        <ul className="aw-workflow-list">
-          <li>Configure algorithm & params</li>
-          <li>Scale & encode features</li>
-          <li>Grid search all candidates</li>
-          <li>Score & rank models</li>
-          <li>Stability check</li>
-          <li className="aw-workflow-active">View results & visualizations</li>
-        </ul>
+        <p className="cl-results-sidebar-note">Models were scored with Silhouette, Calinski–Harabasz, and Davies–Bouldin.</p>
+      </aside>
       </div>
     </div>
   );

@@ -35,6 +35,7 @@ from .schemas import (
     ClusteringResultResponse, ClusterMetrics, StabilityResult,
     CandidateModelResult, ClusterSummary, ClusterFeatureImportance,
     DimensionReductionPoint, ElbowResponse, ElbowDataPoint,
+    TrainingRunSummary, TrainingHistoryResponse,
 )
 from .enums import MLTask, TrainingStatus
 from . import data_processor
@@ -423,6 +424,37 @@ async def start_training(req: TrainingStartRequest) -> TrainingStartResponse:
     if not ds:
         raise HTTPException(404, "Dataset not found")
 
+    # ── Check for cached results (same dataset + config) ──────────────
+    cached = team_db.find_matching_run(
+        dataset_id=req.dataset_id,
+        ml_task=req.ml_task.value,
+        target_column=req.target_column,
+        feature_columns=req.feature_columns,
+        run_type="training",
+    )
+    if cached:
+        cached_run_id = cached["run_id"]
+        # Verify that persisted results still exist on disk/Azure
+        storage = storage_service.get_storage()
+        persisted = storage.get_training_result(cached_run_id)
+        if persisted:
+            logger.info(
+                f"Cache hit! Returning previous run {cached_run_id} "
+                f"(dataset={ds.filename}, target={req.target_column}, task={req.ml_task.value})"
+            )
+            return TrainingStartResponse(
+                run_id=cached_run_id,
+                status=TrainingStatus.COMPLETE,
+                message=(
+                    f"Results loaded from previous run! "
+                    f"Best model: {cached.get('best_algorithm', '?')} "
+                    f"({cached.get('primary_metric', '?')}: "
+                    f"{cached.get('best_metric_value', 0):.4f}). "
+                    f"Trained {cached.get('model_count', '?')} models on {cached.get('created_at', '?')}."
+                ),
+            )
+
+    # ── No cache hit — start new training ──────────────────────────────
     run_id = str(uuid.uuid4())[:8]
     _active_runs[run_id] = {
         "status": TrainingStatus.QUEUED,
@@ -617,6 +649,137 @@ async def _run_training(run_id: str):
         await _update_run(run_id, TrainingStatus.FAILED, 0, f"Training failed: {str(e)}")
         team_db.update_training_run(run_id, TrainingStatus.FAILED)
 
+    # ── Persist results to Azure/local storage (after try/except so
+    #    a persistence failure doesn't mark a successful run as FAILED) ──
+    run = _active_runs.get(run_id)
+    if run and run.get("result"):
+        await _persist_training_result(run_id, run, run["request"], run["dataset"])
+
+
+async def _persist_training_result(run_id: str, run: dict, req, ds):
+    """Persist full training result to Azure/local storage + enrich DB metadata."""
+    try:
+        result = run.get("result", {})
+        lb = result.get("leaderboard", [])
+        best = next((m for m in lb if m.is_best), None) if lb else None
+
+        # Gather all_metrics for persistence
+        all_metrics = {}
+        aml = run.get("aml")
+        frame = run.get("frame")
+        ml_task = result.get("ml_task", "")
+        if aml and frame:
+            try:
+                best_model = h2o_engine.get_best_model(aml)
+                raw_metrics = h2o_engine.get_model_metrics(best_model, frame, ml_task, req.target_column)
+                for k, v in raw_metrics.items():
+                    if v is not None:
+                        try:
+                            fv = float(v)
+                            if not (math.isnan(fv) or math.isinf(fv)):
+                                all_metrics[k] = fv
+                        except (ValueError, TypeError):
+                            pass
+            except Exception:
+                pass
+
+        if not all_metrics and best:
+            all_metrics = {k: v for k, v in best.metrics.items() if k != "model_id" and v is not None}
+
+        # Gather confusion matrix for classification tasks
+        confusion_matrix_data = None
+        if ml_task == "classification" and aml and frame:
+            try:
+                best_model = h2o_engine.get_best_model(aml)
+                cm_data = h2o_engine.get_confusion_matrix(best_model, frame)
+                if cm_data:
+                    confusion_matrix_data = cm_data
+            except Exception:
+                pass
+
+        # Gather residuals for regression tasks
+        residuals_data = None
+        if ml_task == "regression" and aml and frame:
+            try:
+                best_model = h2o_engine.get_best_model(aml)
+                preds = best_model.predict(frame)
+                pred_col = preds.as_data_frame().iloc[:, 0].tolist()
+                actual_col = frame[req.target_column].as_data_frame().iloc[:, 0].tolist()
+                residuals_data = {
+                    "actual": actual_col[:500],
+                    "predicted": pred_col[:500],
+                }
+            except Exception:
+                pass
+
+        # Build serializable result dict
+        serializable_result = {
+            "run_id": run_id,
+            "ml_task": ml_task,
+            "leaderboard": [m.model_dump() if isinstance(m, ModelResult) else m for m in lb],
+            "feature_importance": result.get("feature_importance", []),
+            "best_model_id": best.model_id if best else "",
+            "all_metrics": all_metrics,
+            "config": {
+                "dataset_id": req.dataset_id,
+                "dataset_filename": ds.filename,
+                "target_column": req.target_column,
+                "feature_columns": req.feature_columns,
+                "ml_task": ml_task,
+                "max_models": req.max_models,
+                "max_runtime_secs": req.max_runtime_secs,
+                "nfolds": req.nfolds,
+            },
+            "n_target_classes": run.get("n_target_classes", 2),
+            "created_at": run.get("started_at", datetime.now().isoformat()),
+        }
+        if confusion_matrix_data:
+            serializable_result["confusion_matrix"] = confusion_matrix_data
+        if residuals_data:
+            serializable_result["residuals"] = residuals_data
+
+        # Persist via the storage layer (Azure or local)
+        storage = storage_service.get_storage()
+        storage.save_training_result(run_id, _sanitize_for_json(serializable_result))
+
+        # Upload model binary to Azure (if in Azure mode)
+        saved_path = result.get("saved_model_path", "")
+        if saved_path:
+            model_path = Path(saved_path)
+            if model_path.exists():
+                storage.save_model_binary(run_id, model_path.name, str(model_path))
+
+        # Determine primary metric and its value
+        primary_metric = ""
+        best_metric_value = 0.0
+        if all_metrics:
+            if ml_task == "classification":
+                pref = ["auc", "accuracy", "logloss", "mean_per_class_error"]
+            else:
+                pref = ["rmse", "mae", "r2", "mean_residual_deviance"]
+            primary_metric = next((m for m in pref if m in all_metrics), next(iter(all_metrics), ""))
+            best_metric_value = all_metrics.get(primary_metric, 0.0) or 0.0
+
+        # Enrich the DB row with result metadata
+        team_db.update_run_results(
+            run_id=run_id,
+            ml_task=ml_task,
+            target_column=req.target_column,
+            feature_columns=req.feature_columns,
+            best_model_id=best.model_id if best else "",
+            best_algorithm=best.algorithm if best else "",
+            primary_metric=primary_metric,
+            best_metric_value=best_metric_value,
+            model_count=len(lb),
+            dataset_filename=ds.filename,
+            run_type="training",
+        )
+
+        logger.info(f"Training result persisted for run {run_id} ({len(lb)} models, metric={primary_metric}:{best_metric_value})")
+
+    except Exception as e:
+        logger.warning(f"Failed to persist training result for {run_id}: {e}")
+
 
 async def _update_run(run_id: str, status: TrainingStatus, progress: int, message: str):
     run = _active_runs.get(run_id)
@@ -709,23 +872,65 @@ async def training_websocket(websocket: WebSocket, run_id: str):
 
 # ── Results ────────────────────────────────────────────────────────────────
 
-async def get_leaderboard(run_id: str) -> LeaderboardResponse:
+def _get_result_or_load(run_id: str) -> tuple[dict | None, dict | None]:
+    """
+    Fallback chain: in-memory → local/Azure storage.
+    Returns (run_dict_or_None, result_dict_or_None).
+    When loaded from storage, the result dict has serialized models (plain dicts, not ModelResult).
+    """
     run = _active_runs.get(run_id)
-    if not run or not run.get("result"):
+    if run and run.get("result"):
+        return run, run["result"]
+
+    # Try loading from storage
+    storage = storage_service.get_storage()
+    persisted = storage.get_training_result(run_id)
+    if persisted:
+        return None, persisted
+
+    return None, None
+
+
+def _models_from_persisted(persisted_leaderboard: list[dict]) -> list[ModelResult]:
+    """Convert persisted leaderboard dicts back to ModelResult objects."""
+    models = []
+    for m in persisted_leaderboard:
+        if isinstance(m, ModelResult):
+            models.append(m)
+        else:
+            models.append(ModelResult(
+                model_id=m.get("model_id", ""),
+                algorithm=m.get("algorithm", ""),
+                metrics=m.get("metrics", {}),
+                rank=m.get("rank", 0),
+                is_best=m.get("is_best", False),
+            ))
+    return models
+
+
+async def get_leaderboard(run_id: str) -> LeaderboardResponse:
+    run, result = _get_result_or_load(run_id)
+    if not result:
         raise HTTPException(404, "Results not found. Training may still be in progress.")
 
-    result = run["result"]
+    # Normalize leaderboard to ModelResult objects
+    lb = result.get("leaderboard", [])
+    if lb and isinstance(lb[0], dict):
+        models = _models_from_persisted(lb)
+    else:
+        models = lb
 
     # H2O default sort metric per Appendix D:
     #   binary classification → AUC
     #   multiclass classification → mean_per_class_error
     #   regression → deviance (mean_residual_deviance)
     metric_keys: list[str] = []
-    if result["leaderboard"]:
-        metric_keys = [k for k in result["leaderboard"][0].metrics.keys()]
+    if models:
+        first = models[0]
+        metric_keys = list(first.metrics.keys()) if isinstance(first, ModelResult) else list((first.get("metrics") or {}).keys())
 
-    ml_task = result["ml_task"]
-    target_classes = run.get("n_target_classes", 2)
+    ml_task = result.get("ml_task", "classification")
+    target_classes = run.get("n_target_classes", 2) if run else 2
 
     if ml_task == "classification":
         if target_classes <= 2:
@@ -739,31 +944,45 @@ async def get_leaderboard(run_id: str) -> LeaderboardResponse:
 
     return LeaderboardResponse(
         run_id=run_id,
-        ml_task=result["ml_task"],
+        ml_task=ml_task,
         primary_metric=primary_metric,
-        models=result["leaderboard"],
+        models=models,
     )
 
 
 async def get_best_model(run_id: str):
-
-
-    run = _active_runs.get(run_id)
-    if not run or not run.get("result"):
+    run, result = _get_result_or_load(run_id)
+    if not result:
         raise HTTPException(404, "Results not found")
 
-    result = run["result"]
-    best = next((m for m in result["leaderboard"] if m.is_best), None)
+    lb = result.get("leaderboard", [])
+    models = _models_from_persisted(lb) if lb and isinstance(lb[0], dict) else lb
+    best = next((m for m in models if m.is_best), None) if models else None
 
-    all_metrics = {}
-    aml = run.get("aml")
-    frame = run.get("frame")
-    if aml and frame:
-        try:
-            best_model = h2o_engine.get_best_model(aml)
-            all_metrics = h2o_engine.get_model_metrics(best_model, frame, result["ml_task"])
-        except Exception:
-            pass
+    target_column = ""
+    feature_columns = []
+    if run and run.get("request"):
+        req = run["request"]
+        target_column = req.target_column
+        feature_columns = req.feature_columns
+    elif result.get("config"):
+        target_column = result["config"].get("target_column", "")
+        feature_columns = result["config"].get("feature_columns", [])
+
+    # Persisted metrics first, then overlay live H2O (so PRF from storage is kept if live omits them)
+    all_metrics: dict = dict(result.get("all_metrics") or {})
+    if run:
+        aml = run.get("aml")
+        frame = run.get("frame")
+        if aml and frame:
+            try:
+                best_model = h2o_engine.get_best_model(aml)
+                live = h2o_engine.get_model_metrics(
+                    best_model, frame, result.get("ml_task", ""), target_column or None
+                )
+                all_metrics.update(live)
+            except Exception:
+                pass
 
     if not all_metrics and best:
         all_metrics = {k: v for k, v in best.metrics.items() if k != "model_id"}
@@ -780,96 +999,125 @@ async def get_best_model(run_id: str):
         except (ValueError, TypeError):
             continue
 
-    req = run["request"]
+    feature_importance = result.get("feature_importance", [])
+
     return {
         "run_id": run_id,
         "best_model": best.model_dump() if best else None,
         "all_metrics": cleaned_metrics,
-        "feature_importance": result["feature_importance"][:10],
-        "ml_task": result["ml_task"],
-        "target_column": req.target_column,
-        "feature_columns": req.feature_columns,
+        "feature_importance": feature_importance[:10],
+        "ml_task": result.get("ml_task", ""),
+        "target_column": target_column,
+        "feature_columns": feature_columns,
     }
 
 
 async def get_feature_importance(run_id: str) -> FeatureImportanceResponse:
-    run = _active_runs.get(run_id)
-    if not run or not run.get("result"):
+    run, result = _get_result_or_load(run_id)
+    if not result:
         raise HTTPException(404, "Results not found")
 
-    result = run["result"]
-    best = next((m for m in result["leaderboard"] if m.is_best), None)
+    lb = result.get("leaderboard", [])
+    models = _models_from_persisted(lb) if lb and isinstance(lb[0], dict) else lb
+    best = next((m for m in models if m.is_best), None) if models else None
+
     return FeatureImportanceResponse(
         run_id=run_id,
         model_id=best.model_id if best else "unknown",
-        features=result["feature_importance"][:15],
+        features=result.get("feature_importance", [])[:15],
     )
 
 
 async def get_confusion_matrix(run_id: str) -> ConfusionMatrixResponse:
-    run = _active_runs.get(run_id)
-    if not run or not run.get("result"):
+    run, result = _get_result_or_load(run_id)
+    if not result:
         raise HTTPException(404, "Results not found")
-    if run["result"]["ml_task"] != "classification":
+    if result.get("ml_task") != "classification":
         raise HTTPException(400, "Confusion matrix only available for classification tasks")
 
-    aml = run.get("aml")
-    frame = run.get("frame")
-    if aml and frame:
-        best = h2o_engine.get_best_model(aml)
-        cm_data = h2o_engine.get_confusion_matrix(best, frame)
-        if cm_data:
-            return ConfusionMatrixResponse(
-                run_id=run_id,
-                model_id=best.model_id,
-                labels=cm_data["labels"],
-                matrix=cm_data["matrix"],
-            )
+    # Try live H2O (only works if the run is still in memory)
+    if run:
+        aml = run.get("aml")
+        frame = run.get("frame")
+        if aml and frame:
+            best = h2o_engine.get_best_model(aml)
+            cm_data = h2o_engine.get_confusion_matrix(best, frame)
+            if cm_data:
+                return ConfusionMatrixResponse(
+                    run_id=run_id,
+                    model_id=best.model_id,
+                    labels=cm_data["labels"],
+                    matrix=cm_data["matrix"],
+                )
+
+    # Try persisted confusion matrix
+    if "confusion_matrix" in result:
+        cm = result["confusion_matrix"]
+        return ConfusionMatrixResponse(
+            run_id=run_id,
+            model_id=result.get("best_model_id", "unknown"),
+            labels=cm.get("labels", []),
+            matrix=cm.get("matrix", []),
+        )
+
     raise HTTPException(404, "Confusion matrix data not available")
 
 
 async def get_residuals(run_id: str) -> ResidualsResponse:
-    run = _active_runs.get(run_id)
-    if not run or not run.get("result"):
+    run, result = _get_result_or_load(run_id)
+    if not result:
         raise HTTPException(404, "Results not found")
-    if run["result"]["ml_task"] != "regression":
+    if result.get("ml_task") != "regression":
         raise HTTPException(400, "Residuals only available for regression tasks")
 
-    aml = run.get("aml")
-    frame = run.get("frame")
-    if aml and frame:
-        best = h2o_engine.get_best_model(aml)
-        preds = best.predict(frame)
-        pred_col = preds.as_data_frame().iloc[:, 0].tolist()
-        req = run["request"]
-        actual_col = frame[req.target_column].as_data_frame().iloc[:, 0].tolist()
+    # Try live H2O
+    if run:
+        aml = run.get("aml")
+        frame = run.get("frame")
+        if aml and frame:
+            best = h2o_engine.get_best_model(aml)
+            preds = best.predict(frame)
+            pred_col = preds.as_data_frame().iloc[:, 0].tolist()
+            req = run["request"]
+            actual_col = frame[req.target_column].as_data_frame().iloc[:, 0].tolist()
+            return ResidualsResponse(
+                run_id=run_id,
+                model_id=best.model_id,
+                actual=actual_col[:500],
+                predicted=pred_col[:500],
+            )
+
+    # Try persisted residuals
+    if "residuals" in result:
+        res = result["residuals"]
         return ResidualsResponse(
             run_id=run_id,
-            model_id=best.model_id,
-            actual=actual_col[:500],
-            predicted=pred_col[:500],
+            model_id=result.get("best_model_id", "unknown"),
+            actual=res.get("actual", []),
+            predicted=res.get("predicted", []),
         )
+
     raise HTTPException(404, "Residual data not available")
 
 
 async def export_results(run_id: str, format: str = "csv"):
-    run = _active_runs.get(run_id)
-    if not run or not run.get("result"):
+    run, result = _get_result_or_load(run_id)
+    if not result:
         raise HTTPException(404, "Results not found")
 
-    result = run["result"]
+    lb = result.get("leaderboard", [])
+    models = _models_from_persisted(lb) if lb and isinstance(lb[0], dict) else lb
+
     export_dir = PROCESSED_DATA_DIR / run_id
     export_dir.mkdir(parents=True, exist_ok=True)
 
     if format == "json":
-
-
         export_path = export_dir / "results.json"
         data = {
             "run_id": run_id,
-            "ml_task": result["ml_task"],
-            "leaderboard": [m.model_dump() for m in result["leaderboard"]],
-            "feature_importance": result["feature_importance"][:15],
+            "ml_task": result.get("ml_task", ""),
+            "leaderboard": [m.model_dump() if isinstance(m, ModelResult) else m for m in models],
+            "feature_importance": result.get("feature_importance", [])[:15],
         }
 
         def _json_default(obj):
@@ -882,9 +1130,13 @@ async def export_results(run_id: str, format: str = "csv"):
         import pandas as pd
         export_path = export_dir / "results.csv"
         rows = []
-        for m in result["leaderboard"]:
-            row = {"rank": m.rank, "model_id": m.model_id, "algorithm": m.algorithm, "is_best": m.is_best}
-            row.update(m.metrics)
+        for m in models:
+            if isinstance(m, ModelResult):
+                row = {"rank": m.rank, "model_id": m.model_id, "algorithm": m.algorithm, "is_best": m.is_best}
+                row.update(m.metrics)
+            else:
+                row = {"rank": m.get("rank"), "model_id": m.get("model_id"), "algorithm": m.get("algorithm"), "is_best": m.get("is_best")}
+                row.update(m.get("metrics", {}))
             rows.append(row)
         pd.DataFrame(rows).to_csv(export_path, index=False)
 
@@ -943,10 +1195,15 @@ async def get_random_row(run_id: str) -> dict:
 
 
 async def get_gains_lift(run_id: str) -> GainsLiftResponse:
-    run = _active_runs.get(run_id)
-    if not run or not run.get("result"):
+    run, result = _get_result_or_load(run_id)
+    if not result:
         raise HTTPException(404, "Results not found")
-    if run["result"]["ml_task"] != "classification":
+
+    if result.get("ml_task") != "classification":
+        return GainsLiftResponse(run_id=run_id, rows=[])
+
+    # Gains/lift needs live H2O AutoML + frame; absent after restart or storage-only load.
+    if not run:
         return GainsLiftResponse(run_id=run_id, rows=[])
 
     aml = run.get("aml")
@@ -962,34 +1219,40 @@ async def get_gains_lift(run_id: str) -> GainsLiftResponse:
 
 
 async def generate_ai_summary(run_id: str) -> AISummaryResponse:
-
-
-    run = _active_runs.get(run_id)
-    if not run or not run.get("result"):
+    run, result = _get_result_or_load(run_id)
+    if not result:
         raise HTTPException(404, "Results not found")
 
-    result = run["result"]
-    req = run["request"]
-    best = next((m for m in result["leaderboard"] if m.is_best), None)
-    ml_task = result["ml_task"]
+    lb = result.get("leaderboard", [])
+    models = _models_from_persisted(lb) if lb and isinstance(lb[0], dict) else lb
+    best = next((m for m in models if m.is_best), None) if models else None
+    ml_task = result.get("ml_task", "")
+
+    tc = ""
+    if run and run.get("request"):
+        tc = run["request"].target_column
+    elif result.get("config"):
+        tc = result["config"].get("target_column", "")
 
     all_metrics = {}
-    aml = run.get("aml")
-    frame = run.get("frame")
-    if aml and frame:
-        try:
-            best_model = h2o_engine.get_best_model(aml)
-            raw_metrics = h2o_engine.get_model_metrics(best_model, frame, ml_task)
-            for k, v in raw_metrics.items():
-                if v is not None:
-                    try:
-                        fv = float(v)
-                        if not (math.isnan(fv) or math.isinf(fv)):
-                            all_metrics[k] = fv
-                    except (ValueError, TypeError):
-                        pass
-        except Exception:
-            pass
+    # Try live H2O
+    if run:
+        aml = run.get("aml")
+        frame = run.get("frame")
+        if aml and frame:
+            try:
+                best_model = h2o_engine.get_best_model(aml)
+                raw_metrics = h2o_engine.get_model_metrics(best_model, frame, ml_task, tc or None)
+                for k, v in raw_metrics.items():
+                    if v is not None:
+                        try:
+                            fv = float(v)
+                            if not (math.isnan(fv) or math.isinf(fv)):
+                                all_metrics[k] = fv
+                        except (ValueError, TypeError):
+                            pass
+            except Exception:
+                pass
 
     if not all_metrics and best:
         for k, v in best.metrics.items():
@@ -1001,10 +1264,15 @@ async def generate_ai_summary(run_id: str) -> AISummaryResponse:
                 except (ValueError, TypeError):
                     pass
 
+    # Also try persisted all_metrics
+    if not all_metrics and "all_metrics" in result:
+        all_metrics = result["all_metrics"]
+
     best_algo = best.algorithm if best else "Unknown"
     best_id = best.model_id if best else "Unknown"
-    target = req.target_column
-    num_models = len(result["leaderboard"])
+    target = tc
+
+    num_models = len(lb)
     metrics_str = ", ".join(f"{k}: {v}" for k, v in (all_metrics or {}).items() if v is not None)
 
     ai = ai_service.get_ai_service()
@@ -1106,6 +1374,35 @@ async def start_clustering(req: ClusteringStartRequest) -> ClusteringStartRespon
     if not ds:
         raise HTTPException(404, "Dataset not found")
 
+    # ── Check for cached clustering results ───────────────────────────
+    cached = team_db.find_matching_run(
+        dataset_id=req.dataset_id,
+        ml_task="clustering",
+        target_column="",
+        feature_columns=req.feature_columns,
+        run_type="clustering",
+    )
+    if cached:
+        cached_run_id = cached["run_id"]
+        storage = storage_service.get_storage()
+        persisted = storage.get_clustering_result(cached_run_id)
+        if persisted:
+            logger.info(
+                f"Clustering cache hit! Returning previous run {cached_run_id} "
+                f"(dataset={ds.filename}, features={req.feature_columns})"
+            )
+            return ClusteringStartResponse(
+                run_id=cached_run_id,
+                status="complete",
+                message=(
+                    f"Results loaded from previous clustering! "
+                    f"Best: {cached.get('best_algorithm', '?')} "
+                    f"(score: {cached.get('best_metric_value', 0):.3f}). "
+                    f"Tested {cached.get('model_count', '?')} models on {cached.get('created_at', '?')}."
+                ),
+            )
+
+    # ── No cache hit — start new clustering ────────────────────────────
     run_id = "cl-" + str(uuid.uuid4())[:8]
     _clustering_runs[run_id] = {
         "status": "queued",
@@ -1192,34 +1489,6 @@ async def _run_clustering(run_id: str):
             "recommended_k": sanitized["recommended_k"],
         }
 
-        # Post-clustering H2O ML
-        post_ml_run_id = None
-        if req.run_post_ml and req.post_ml_target:
-            await _clustering_broadcast(run_id, 90, "Starting post-clustering H2O AutoML...")
-            try:
-                df["cluster_label"] = result["best_labels"]
-                features_with_cluster = req.feature_columns + ["cluster_label"]
-                post_ml_req = TrainingStartRequest(
-                    dataset_id=req.dataset_id,
-                    target_column=req.post_ml_target,
-                    feature_columns=features_with_cluster,
-                    ml_task=MLTask(req.post_ml_task or "classification"),
-                    models=[],
-                    auto_mode=True,
-                    train_test_split=0.8,
-                    nfolds=5,
-                    max_models=req.post_ml_max_models,
-                    max_runtime_secs=req.post_ml_max_runtime_secs,
-                )
-                post_resp = await start_training(post_ml_req)
-                post_ml_run_id = post_resp.run_id
-                run["result"]["post_ml_run_id"] = post_ml_run_id
-                run["result"]["post_ml_status"] = "running"
-            except Exception as e:
-                logger.warning(f"Post-clustering ML failed: {e}")
-                run["result"]["post_ml_run_id"] = None
-                run["result"]["post_ml_status"] = f"failed: {e}"
-
         # Save clustered CSV with cluster_label column
         await _clustering_broadcast(run_id, 95, "Saving clustered dataset...")
         try:
@@ -1238,15 +1507,47 @@ async def _run_clustering(run_id: str):
         best_algo = result["best_algorithm"]
         best_score = result["best_metrics"]["composite_score"]
 
-        # Persist result + elbow to disk so they survive backend restarts
+        # Persist result + elbow to Azure/local storage
         try:
+            storage = storage_service.get_storage()
+            full_clustering_data = {
+                "result": run["result"],
+                "elbow": run["elbow"],
+                "config": {
+                    "dataset_id": req.dataset_id,
+                    "dataset_filename": ds.filename,
+                    "feature_columns": req.feature_columns,
+                    "algorithm": req.algorithm,
+                    "n_clusters": req.n_clusters,
+                },
+                "created_at": datetime.now().isoformat(),
+            }
+            storage.save_clustering_result(run_id, full_clustering_data)
+
+            # Also save elbow separately for backward compat
             persist_dir = PROCESSED_DATA_DIR / run_id
             persist_dir.mkdir(parents=True, exist_ok=True)
-            with open(persist_dir / "clustering_result.json", "w") as f:
-                json.dump(run["result"], f)
             with open(persist_dir / "clustering_elbow.json", "w") as f:
                 json.dump(run["elbow"], f)
-            logger.info(f"Persisted clustering result to {persist_dir}")
+
+            # Enrich DB
+            team_db.save_clustering_run(run_id, req.dataset_id)
+            team_db.update_training_run(run_id, TrainingStatus.COMPLETE)
+            team_db.update_run_results(
+                run_id=run_id,
+                ml_task="clustering",
+                target_column="",
+                feature_columns=req.feature_columns,
+                best_model_id="",
+                best_algorithm=best_algo,
+                primary_metric="composite_score",
+                best_metric_value=best_score,
+                model_count=n_tested,
+                dataset_filename=ds.filename,
+                run_type="clustering",
+            )
+
+            logger.info(f"Clustering result persisted for {run_id}")
         except Exception as e:
             logger.warning(f"Failed to persist clustering result: {e}")
 
@@ -1265,10 +1566,23 @@ async def _run_clustering(run_id: str):
 async def get_clustering_status(run_id: str) -> TrainingStatusResponse:
     run = _clustering_runs.get(run_id)
     if not run:
-        raise HTTPException(404, "Clustering run not found")
+        # Fallback to DB (handles persisted/cached runs after restart)
+        db_run = team_db.get_training_run(run_id)
+        if not db_run:
+            raise HTTPException(404, "Clustering run not found")
+        return TrainingStatusResponse(
+            run_id=run_id,
+            status=TrainingStatus(db_run["status"]),
+            progress_percent=100 if db_run["status"] == "complete" else 0,
+            current_stage=db_run["status"],
+        )
+    try:
+        st = TrainingStatus(run["status"])
+    except ValueError:
+        st = TrainingStatus.TRAINING
     return TrainingStatusResponse(
         run_id=run_id,
-        status=TrainingStatus(run["status"]) if run["status"] in TrainingStatus.__members__.values() else TrainingStatus.TRAINING,
+        status=st,
         progress_percent=run["progress"],
         current_stage=run["status"],
         message=run["message"],
@@ -1276,7 +1590,17 @@ async def get_clustering_status(run_id: str) -> TrainingStatusResponse:
 
 
 def _load_clustering_result_from_disk(run_id: str) -> dict | None:
-    """Load persisted clustering result from disk as fallback."""
+    """Load persisted clustering result — try storage layer (Azure/local), then raw disk."""
+    # Try storage layer (handles Azure + local cache)
+    storage = storage_service.get_storage()
+    persisted = storage.get_clustering_result(run_id)
+    if persisted:
+        # The new format wraps result inside a dict with config/elbow
+        if "result" in persisted:
+            return persisted["result"]
+        return persisted
+
+    # Legacy raw disk fallback
     result_file = PROCESSED_DATA_DIR / run_id / "clustering_result.json"
     if result_file.exists():
         try:
@@ -1324,8 +1648,6 @@ async def get_clustering_result(run_id: str) -> ClusteringResultResponse:
         feature_columns=r["feature_columns"],
         total_candidates_tested=r["total_candidates_tested"],
         pca_points=[DimensionReductionPoint(**p) for p in r["pca_points"]] if r.get("pca_points") else None,
-        post_ml_run_id=r.get("post_ml_run_id"),
-        post_ml_status=r.get("post_ml_status"),
     )
 
 
@@ -1346,57 +1668,6 @@ async def get_elbow_analysis(run_id: str) -> ElbowResponse:
     )
 
 
-async def apply_cluster_labels(run_id: str, dataset_id: str) -> DatasetMetadata:
-    """Register the clustered CSV as a new dataset and return its metadata."""
-
-    # Try in-memory cache first
-    run = _clustering_runs.get(run_id)
-    clustered_path = None
-    clustered_filename = None
-
-    if run and run.get("clustered_filepath"):
-        clustered_path = Path(run["clustered_filepath"])
-        clustered_filename = run["clustered_filename"]
-    else:
-        # Fallback: find on disk by looking at the source dataset's directory
-        ds = team_db.get_dataset(dataset_id)
-        if ds:
-            storage = storage_service.get_storage()
-            src_path = Path(storage.get_dataset_path(dataset_id, ds.filename))
-            candidate = src_path.parent / ds.filename.replace(".csv", "_clustered.csv")
-            if candidate.exists():
-                clustered_path = candidate
-                clustered_filename = candidate.name
-
-    if not clustered_path or not clustered_path.exists():
-        raise HTTPException(404, "Clustered dataset not found. Please re-run clustering.")
-
-    if not clustered_filename:
-        clustered_filename = clustered_path.name
-
-    existing = team_db.find_dataset_by_filename(clustered_filename)
-    if existing:
-        storage = storage_service.get_storage()
-        try:
-            storage.delete_dataset(existing.id, existing.filename)
-        except Exception:
-            pass
-        team_db.delete_dataset(existing.id)
-
-    new_dataset_id = "cld-" + str(uuid.uuid4())[:8]
-    storage = storage_service.get_storage()
-    content = clustered_path.read_bytes()
-    storage.save_dataset(new_dataset_id, clustered_filename, content)
-    meta = data_processor.get_metadata(
-        storage.get_dataset_path(new_dataset_id, clustered_filename),
-        new_dataset_id,
-        clustered_filename,
-    )
-    meta.description = f"Clustered version with cluster_label column (from run {run_id})"
-    team_db.save_dataset(meta)
-    return meta
-
-
 async def clustering_websocket(websocket: WebSocket, run_id: str):
     await websocket.accept()
     _clustering_ws.setdefault(run_id, []).append(websocket)
@@ -1408,3 +1679,86 @@ async def clustering_websocket(websocket: WebSocket, run_id: str):
     finally:
         if websocket in _clustering_ws.get(run_id, []):
             _clustering_ws[run_id].remove(websocket)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Training History & Persistence Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def list_training_history() -> TrainingHistoryResponse:
+    """Return all completed training/clustering runs from the DB."""
+    rows = team_db.list_completed_runs()
+    runs = []
+    for r in rows:
+        runs.append(TrainingRunSummary(
+            run_id=r.get("run_id", ""),
+            dataset_id=r.get("dataset_id", ""),
+            dataset_name=r.get("dataset_filename", ""),
+            ml_task=r.get("ml_task", ""),
+            target_column=r.get("target_column", ""),
+            best_model_id=r.get("best_model_id", ""),
+            best_algorithm=r.get("best_algorithm", ""),
+            primary_metric=r.get("primary_metric", ""),
+            best_metric_value=r.get("best_metric_value", 0.0) or 0.0,
+            model_count=r.get("model_count", 0) or 0,
+            status=r.get("status", "complete"),
+            run_type=r.get("run_type", "training"),
+            created_at=str(r.get("created_at", "")),
+        ))
+    return TrainingHistoryResponse(runs=runs)
+
+
+async def get_dataset_training_history(dataset_id: str) -> TrainingHistoryResponse:
+    """Return all completed runs that used a specific dataset."""
+    rows = team_db.get_runs_by_dataset(dataset_id)
+    runs = []
+    for r in rows:
+        runs.append(TrainingRunSummary(
+            run_id=r.get("run_id", ""),
+            dataset_id=r.get("dataset_id", ""),
+            dataset_name=r.get("dataset_filename", ""),
+            ml_task=r.get("ml_task", ""),
+            target_column=r.get("target_column", ""),
+            best_model_id=r.get("best_model_id", ""),
+            best_algorithm=r.get("best_algorithm", ""),
+            primary_metric=r.get("primary_metric", ""),
+            best_metric_value=r.get("best_metric_value", 0.0) or 0.0,
+            model_count=r.get("model_count", 0) or 0,
+            status=r.get("status", "complete"),
+            run_type=r.get("run_type", "training"),
+            created_at=str(r.get("created_at", "")),
+        ))
+    return TrainingHistoryResponse(runs=runs)
+
+
+async def load_persisted_result(run_id: str) -> dict:
+    """Load a previously trained result from Azure/local storage into the response."""
+    # Already in memory?
+    run = _active_runs.get(run_id)
+    if run and run.get("result"):
+        return {"status": "loaded", "source": "memory", "run_id": run_id}
+
+    # Try storage
+    storage = storage_service.get_storage()
+    result = storage.get_training_result(run_id)
+    if result:
+        return {
+            "status": "loaded",
+            "source": "storage",
+            "run_id": run_id,
+            "ml_task": result.get("ml_task", ""),
+            "model_count": len(result.get("leaderboard", [])),
+            "best_model_id": result.get("best_model_id", ""),
+        }
+
+    # Try clustering
+    cl_result = storage.get_clustering_result(run_id)
+    if cl_result:
+        return {
+            "status": "loaded",
+            "source": "storage",
+            "run_id": run_id,
+            "ml_task": "clustering",
+        }
+
+    raise HTTPException(404, "No persisted result found for this run")

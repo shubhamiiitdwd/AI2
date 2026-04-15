@@ -18,6 +18,20 @@ from sklearn.decomposition import PCA
 
 logger = logging.getLogger(__name__)
 
+# Columns that must not be used as clustering inputs (labels / leakage from prior runs).
+_LEAKAGE_SUBSTRINGS = ("cluster_label", "cluster_id", "prediction_cluster")
+
+
+def sanitize_clustering_feature_columns(feature_cols: list[str]) -> list[str]:
+    """Drop label-like columns so clustering and F-importance stay meaningful."""
+    out = []
+    for c in feature_cols:
+        cl = c.lower().strip()
+        if cl in _LEAKAGE_SUBSTRINGS or cl.endswith("_cluster"):
+            continue
+        out.append(c)
+    return out
+
 
 # ── Feature preparation ────────────────────────────────────────────────────
 
@@ -241,6 +255,7 @@ def get_feature_importance_per_cluster(
 ) -> list[dict]:
     from sklearn.feature_selection import f_classif
 
+    feature_cols = sanitize_clustering_feature_columns(feature_cols)
     numeric_cols = [c for c in feature_cols if df[c].dtype in ("float64", "int64", "float32", "int32")]
     if not numeric_cols:
         return []
@@ -254,11 +269,17 @@ def get_feature_importance_per_cluster(
 
     try:
         f_scores, _ = f_classif(X_valid, y_valid)
+        f_scores = np.asarray(f_scores, dtype=float)
+        f_scores = np.nan_to_num(f_scores, nan=0.0, posinf=0.0, neginf=0.0)
         total = float(np.nansum(f_scores))
+        if total <= 0 or not np.isfinite(total):
+            total = 1.0
         result = []
         for col, f_val in zip(numeric_cols, f_scores):
             imp = float(f_val / total) if total > 0 else 0.0
-            result.append({"feature": col, "importance": round(imp, 4)})
+            if not np.isfinite(imp):
+                imp = 0.0
+            result.append({"feature": col, "importance": round(imp, 6)})
         return sorted(result, key=lambda x: x["importance"], reverse=True)
     except Exception as e:
         logger.warning(f"Feature importance failed: {e}")
@@ -268,6 +289,10 @@ def get_feature_importance_per_cluster(
 # ── Elbow analysis ─────────────────────────────────────────────────────────
 
 def get_elbow_data(X: np.ndarray, max_k: int = 10) -> tuple[list[dict], int]:
+    """
+    KMeans-only sweep for visualization: pick K in [2, max_k] with best silhouette.
+    Independent of the multi-algo leaderboard (GMM/DBSCAN and composite score).
+    """
     data = []
     best_k, best_sil = 2, -1.0
     for k in range(2, max_k + 1):
@@ -322,6 +347,9 @@ def run_full_pipeline(
             progress_callback(pct, msg)
 
     _progress(10, "Scaling & encoding features...")
+    feature_cols = sanitize_clustering_feature_columns(feature_cols)
+    if not feature_cols:
+        raise ValueError("No valid feature columns after removing label/leakage columns.")
     X, feature_names = prepare_features(df, feature_cols)
 
     _progress(15, "Shortlisting candidate algorithms...")

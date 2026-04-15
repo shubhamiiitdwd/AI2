@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useMemo } from 'react';
 import './AutoMLWizard.css';
 import type { WizardStep, DatasetMetadata, ColumnInfo, MLTask, ModelType, TrainingStartRequest, ClusteringResultResponse } from './types';
 import WizardStepper from './components/WizardStepper';
@@ -30,49 +30,73 @@ const AutoMLWizard = ({ onBack }: Props) => {
   const [maxModels, setMaxModels] = useState(20);
   const [maxRuntimeSecs, setMaxRuntimeSecs] = useState(300);
   const [runId, setRunId] = useState<string | null>(null);
+  /** True after the current run has finished training (drives Training-step review UI; reset when a new run starts). */
+  const [trainingFinished, setTrainingFinished] = useState(false);
   const [clusteringResult, setClusteringResult] = useState<ClusteringResultResponse | null>(null);
-  const [clusteringDirect, setClusteringDirect] = useState(false);
-  // Save pre-clustering state so user can go back to clustering results
-  const [preClusteringDataset, setPreClusteringDataset] = useState<DatasetMetadata | null>(null);
-  const [preClusteringColumns, setPreClusteringColumns] = useState<ColumnInfo[]>([]);
-  const [preClusteringFeatures, setPreClusteringFeatures] = useState<string[]>([]);
-  const [postClusteringActive, setPostClusteringActive] = useState(false);
+  const [clusteringRunId, setClusteringRunId] = useState<string | null>(null);
 
   const isClustering = mlTask === 'clustering';
-  const showClusteringInStepper = isClustering || (postClusteringActive && !!clusteringResult);
+
+  const clusteringDisplayStep = useMemo(() => {
+    if (!isClustering) return 0;
+    if (step === 0) return 0;
+    if (step === 1) return 1;
+    if (step === 2) return 2;
+    if (step === 3) return 3;
+    return 0;
+  }, [isClustering, step]);
+
+  const clusteringCompletedSteps = useMemo(() => {
+    if (!isClustering) return completedSteps;
+    const c: number[] = [];
+    if (completedSteps.includes(0)) c.push(0);
+    if (completedSteps.includes(1)) c.push(1);
+    if (completedSteps.includes(2)) c.push(2);
+    if (clusteringResult) c.push(3);
+    return c;
+  }, [isClustering, completedSteps, clusteringResult]);
 
   const handleDatasetSelect = async (ds: DatasetMetadata) => {
     setDataset(ds);
     try {
       const colData = await api.getDatasetColumns(ds.id);
       setColumns(colData.columns);
-      const features = colData.columns.map((c) => c.name);
+      const features = colData.columns
+        .map((c) => c.name)
+        .filter((name) => !/cluster_label|cluster_id|prediction_cluster|_cluster$/i.test(name));
       setFeatureColumns(features);
     } catch { /* ignore */ }
-    // Stay on step 0 to show dataset info + task picker; user clicks "Continue" to proceed
   };
 
   const handleClusteringDatasetSelect = async (ds: DatasetMetadata) => {
     setDataset(ds);
     setMlTask('clustering');
-    setClusteringDirect(true);
+    setClusteringRunId(null);
+    setClusteringResult(null);
     try {
       const colData = await api.getDatasetColumns(ds.id);
       setColumns(colData.columns);
-      const features = colData.columns.map((c) => c.name);
+      const features = colData.columns
+        .map((c) => c.name)
+        .filter((name) => !/cluster_label|cluster_id|prediction_cluster|_cluster$/i.test(name));
       setFeatureColumns(features);
     } catch { /* ignore */ }
-    setCompletedSteps((prev) => [...new Set([...prev, 0, 1, 2])]);
-    setStep(3);
+    setCompletedSteps((prev) => [...new Set([...prev, 0, 1])]);
+    setStep(1);
   };
 
   const handleClusteringDetected = useCallback(() => {
     setMlTask('clustering');
-    setClusteringDirect(true);
+    setClusteringRunId(null);
+    setClusteringResult(null);
     if (dataset) {
-      setFeatureColumns(columns.map((c) => c.name));
-      setCompletedSteps((prev) => [...new Set([...prev, 0, 1, 2])]);
-      setStep(3);
+      setFeatureColumns(
+        columns
+          .map((c) => c.name)
+          .filter((name) => !/cluster_label|cluster_id|prediction_cluster|_cluster$/i.test(name)),
+      );
+      setCompletedSteps((prev) => [...new Set([...prev, 0, 1])]);
+      setStep(1);
     }
   }, [dataset, columns]);
 
@@ -81,7 +105,28 @@ const AutoMLWizard = ({ onBack }: Props) => {
     setStep(2);
   };
 
+  const handleClusteringStarted = useCallback(async (rid: string) => {
+    setClusteringRunId(rid);
+    setClusteringResult(null);
+    setCompletedSteps((prev) => [...new Set([...prev, 1, 2])]);
+
+    // Check if this is a cached/completed run — skip directly to results
+    try {
+      const status = await api.getClusteringStatus(rid);
+      if (status.status === 'complete') {
+        const result = await api.getClusteringResult(rid);
+        setClusteringResult(result);
+        setCompletedSteps((prev) => [...new Set([...prev, 1, 2, 3])]);
+        setStep(3); // Jump straight to results
+        return;
+      }
+    } catch { /* new run, proceed normally */ }
+
+    setStep(2); // Normal: go to execution/logs view
+  }, []);
+
   const handleStartTraining = async () => {
+    setTrainingFinished(false);
     setCompletedSteps((prev) => [...new Set([...prev, 2])]);
     setStep(3);
 
@@ -100,87 +145,51 @@ const AutoMLWizard = ({ onBack }: Props) => {
       };
       const res = await api.startTraining(req);
       setRunId(res.run_id);
+
+      // Cache hit — backend returned previous results instantly
+      if (res.status === 'complete') {
+        setTrainingFinished(true);
+        setCompletedSteps((prev) => [...new Set([...prev, 2, 3])]);
+        setStep(4); // Jump directly to Results step
+      }
     } catch (e) {
       alert('Failed to start training. Check backend connection.');
       setStep(2);
     }
   };
 
-  const [clusteringRunId, setClusteringRunId] = useState<string | null>(null);
-
   const handleClusteringComplete = useCallback((result: ClusteringResultResponse) => {
     setClusteringResult(result);
-    setClusteringRunId(result.run_id);
-    setCompletedSteps((prev) => [...new Set([...prev, 3])]);
+    setCompletedSteps((prev) => [...new Set([...prev, 2])]);
   }, []);
 
-  const [postClusteringDataset, setPostClusteringDataset] = useState<DatasetMetadata | null>(null);
-  const [postClusteringColumns, setPostClusteringColumns] = useState<ColumnInfo[]>([]);
-
-  const handlePostClusteringContinue = useCallback(async () => {
-    if (!clusteringRunId || !dataset) return;
-
-    // If we already applied cluster labels before, reuse that dataset
-    if (postClusteringDataset) {
-      setPreClusteringDataset(dataset);
-      setPreClusteringColumns(columns);
-      setPreClusteringFeatures(featureColumns);
-      setDataset(postClusteringDataset);
-      setColumns(postClusteringColumns);
-      setFeatureColumns(postClusteringColumns.map((c) => c.name));
-      setMlTask('classification');
-      setClusteringDirect(false);
-      setPostClusteringActive(true);
-      setCompletedSteps((prev) => [...new Set([...prev, 0, 3])]);
-      setStep(1);
-      return;
-    }
-
-    try {
-      setPreClusteringDataset(dataset);
-      setPreClusteringColumns(columns);
-      setPreClusteringFeatures(featureColumns);
-
-      const newDs = await api.applyClusterLabels(clusteringRunId, dataset.id);
-      setDataset(newDs);
-      const colData = await api.getDatasetColumns(newDs.id);
-      setColumns(colData.columns);
-      setFeatureColumns(colData.columns.map((c) => c.name));
-      setPostClusteringDataset(newDs);
-      setPostClusteringColumns(colData.columns);
-      setTargetColumn('');
-      setMlTask('classification');
-      setClusteringDirect(false);
-      setPostClusteringActive(true);
-      setCompletedSteps((prev) => [...new Set([...prev, 0, 3])]);
-      setStep(1);
-    } catch {
-      alert('Failed to apply cluster labels. Try again.');
-    }
-  }, [clusteringRunId, dataset, columns, featureColumns, postClusteringDataset, postClusteringColumns]);
-
-  const handleBackToClusteringResults = useCallback(() => {
-    if (preClusteringDataset) {
-      setDataset(preClusteringDataset);
-      setColumns(preClusteringColumns);
-      setFeatureColumns(preClusteringFeatures);
-    }
-    setMlTask('clustering');
-    setClusteringDirect(true);
-    setPostClusteringActive(false);
-    setCompletedSteps((prev) => [...new Set([...prev, 0, 1, 2, 3])]);
-    setStep(3);
-  }, [preClusteringDataset, preClusteringColumns, preClusteringFeatures]);
-
   const goToStep = useCallback((s: WizardStep) => {
-    if (s === 3 && postClusteringActive && clusteringResult) {
-      handleBackToClusteringResults();
-      return;
-    }
     setStep(s);
-  }, [postClusteringActive, clusteringResult, handleBackToClusteringResults]);
+  }, []);
+
+  const handleClusteringStepClick = useCallback(
+    (displayIdx: number) => {
+      if (displayIdx === 0) {
+        setStep(0);
+        return;
+      }
+      if (displayIdx === 1) {
+        setStep(1);
+        return;
+      }
+      if (displayIdx === 2) {
+        setStep(2);
+        return;
+      }
+      if (displayIdx === 3 && clusteringResult) {
+        setStep(3);
+      }
+    },
+    [clusteringResult],
+  );
 
   const handleTrainingComplete = useCallback(() => {
+    setTrainingFinished(true);
     setCompletedSteps((prev) => [...new Set([...prev, 3])]);
     setStep(4);
   }, []);
@@ -193,17 +202,11 @@ const AutoMLWizard = ({ onBack }: Props) => {
     setTargetColumn('');
     setFeatureColumns([]);
     setRunId(null);
+    setTrainingFinished(false);
     setAutoMode(false);
     setSelectedModels(['DRF', 'GBM', 'XGBoost']);
     setClusteringResult(null);
     setClusteringRunId(null);
-    setClusteringDirect(false);
-    setPreClusteringDataset(null);
-    setPreClusteringColumns([]);
-    setPreClusteringFeatures([]);
-    setPostClusteringActive(false);
-    setPostClusteringDataset(null);
-    setPostClusteringColumns([]);
     setMlTask('classification');
   };
 
@@ -222,11 +225,30 @@ const AutoMLWizard = ({ onBack }: Props) => {
 
       <div className="aw-container">
         <div className="aw-title-section">
-          <h1 className="aw-title">AutoML Wizard</h1>
-          <p className="aw-subtitle">Train and optimize machine learning models automatically with our guided wizard</p>
+          <h1 className="aw-title">{isClustering ? 'Clustering' : 'AutoML Wizard'}</h1>
+          <p className="aw-subtitle">
+            {isClustering
+              ? 'Select data, configure features and search, then review logs and results.'
+              : 'Train and optimize machine learning models automatically with our guided wizard'}
+          </p>
         </div>
 
-        <WizardStepper currentStep={step} onStepClick={goToStep} completedSteps={completedSteps} isClustering={showClusteringInStepper} />
+        {isClustering ? (
+          <WizardStepper
+            mode="clustering"
+            currentStep={step}
+            clusteringDisplayStep={clusteringDisplayStep}
+            completedSteps={clusteringCompletedSteps}
+            onClusteringStepClick={handleClusteringStepClick}
+          />
+        ) : (
+          <WizardStepper
+            mode="automl"
+            currentStep={step}
+            completedSteps={completedSteps}
+            onStepClick={goToStep}
+          />
+        )}
 
         <div className="aw-content">
           {step === 0 && (
@@ -234,8 +256,30 @@ const AutoMLWizard = ({ onBack }: Props) => {
               dataset={dataset}
               onSelect={handleDatasetSelect}
               onClusteringSelect={handleClusteringDatasetSelect}
-              onContinue={(taskChoice) => {
+              onContinue={async (taskChoice) => {
                 if (!dataset) return;
+                if (taskChoice === 'auto') {
+                  try {
+                    const detected = await api.autoDetectTask(dataset.id);
+                    const t = detected.task as MLTask;
+                    setMlTask(t);
+                    if (t === 'clustering') {
+                      setClusteringRunId(null);
+                      setClusteringResult(null);
+                      const colData = await api.getDatasetColumns(dataset.id);
+                      setColumns(colData.columns);
+                      const features = colData.columns
+                        .map((c) => c.name)
+                        .filter((name) => !/cluster_label|cluster_id|prediction_cluster|_cluster$/i.test(name));
+                      setFeatureColumns(features);
+                      setCompletedSteps((prev) => [...new Set([...prev, 0, 1])]);
+                      setStep(1);
+                      return;
+                    }
+                  } catch {
+                    /* fall through to generic configure step */
+                  }
+                }
                 if (taskChoice && taskChoice !== 'auto') {
                   setMlTask(taskChoice as MLTask);
                 }
@@ -261,13 +305,15 @@ const AutoMLWizard = ({ onBack }: Props) => {
               onTargetChange={setTargetColumn}
               onFeaturesChange={setFeatureColumns}
               onTaskSuggest={setMlTask}
-              onContinue={handleConfigContinue}
+              onContinue={isClustering ? () => {} : handleConfigContinue}
               onClusteringDetected={handleClusteringDetected}
-              onBack={postClusteringActive ? handleBackToClusteringResults : () => setStep(0)}
-              backLabel={postClusteringActive ? '← Back to Clustering Results' : '← Back to Select Dataset'}
+              onBack={() => setStep(0)}
+              backLabel={'← Back to Select Dataset'}
+              clusteringMode={isClustering}
+              onClusteringStart={isClustering ? handleClusteringStarted : undefined}
             />
           )}
-          {step === 2 && (
+          {step === 2 && !isClustering && (
             <StepConfiguration
               mlTask={mlTask}
               selectedModels={selectedModels}
@@ -287,19 +333,36 @@ const AutoMLWizard = ({ onBack }: Props) => {
               onBack={() => setStep(1)}
             />
           )}
-          {step === 3 && isClustering && dataset && (
-            <StepClustering
-              datasetId={dataset.id}
-              featureColumns={featureColumns}
-              columns={columns}
-              onComplete={handleClusteringComplete}
-              onContinueToSupervisedML={handlePostClusteringContinue}
-              onBack={() => setStep(1)}
-              existingResult={clusteringResult}
-            />
-          )}
+          {/* Keep StepClustering mounted (hidden) on steps 0–1 when a run exists so logs/state survive Select dataset / Clustering configuration. */}
+          {isClustering &&
+            dataset &&
+            (step === 2 ||
+              step === 3 ||
+              ((step === 0 || step === 1) && clusteringRunId)) && (
+              <div
+                className={step === 0 || step === 1 ? 'aw-clustering-keepalive' : undefined}
+                style={step === 0 || step === 1 ? { display: 'none' } : undefined}
+                aria-hidden={step === 0 || step === 1}
+              >
+                <StepClustering
+                  datasetId={dataset.id}
+                  featureColumns={featureColumns}
+                  columns={columns}
+                  wizardView={step === 3 ? 'results' : 'execution'}
+                  runId={clusteringRunId}
+                  clusteringResult={clusteringResult}
+                  onComplete={handleClusteringComplete}
+                  onViewResults={() => {
+                    setCompletedSteps((prev) => [...new Set([...prev, 3])]);
+                    setStep(3);
+                  }}
+                  onBackToLogs={() => setStep(2)}
+                  onBack={() => setStep(1)}
+                />
+              </div>
+            )}
           {step === 3 && !isClustering && runId && (
-            <StepTraining runId={runId} onComplete={handleTrainingComplete} reviewMode={completedSteps.includes(3)} onBack={() => setStep(2)} />
+            <StepTraining runId={runId} onComplete={handleTrainingComplete} reviewMode={trainingFinished} onBack={() => setStep(2)} />
           )}
           {step === 4 && runId && (
             <StepResults runId={runId} onBack={() => setStep(3)} />

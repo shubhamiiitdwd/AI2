@@ -37,7 +37,35 @@ def init_db():
         """)
 
 
+def _migrate_db():
+    """Add new columns to training_runs table if they don't exist."""
+    new_columns = [
+        ("ml_task", "TEXT DEFAULT ''"),
+        ("target_column", "TEXT DEFAULT ''"),
+        ("feature_columns", "TEXT DEFAULT '[]'"),
+        ("best_model_id", "TEXT DEFAULT ''"),
+        ("best_algorithm", "TEXT DEFAULT ''"),
+        ("primary_metric", "TEXT DEFAULT ''"),
+        ("best_metric_value", "REAL DEFAULT 0"),
+        ("model_count", "INTEGER DEFAULT 0"),
+        ("dataset_filename", "TEXT DEFAULT ''"),
+        ("run_type", "TEXT DEFAULT 'training'"),
+    ]
+    with _get_conn() as conn:
+        # Get existing columns
+        cursor = conn.execute("PRAGMA table_info(training_runs)")
+        existing_cols = {row["name"] for row in cursor.fetchall()}
+
+        for col_name, col_def in new_columns:
+            if col_name not in existing_cols:
+                try:
+                    conn.execute(f"ALTER TABLE training_runs ADD COLUMN {col_name} {col_def}")
+                except Exception:
+                    pass
+
+
 init_db()
+_migrate_db()
 
 
 def _cleanup_duplicate_datasets():
@@ -109,3 +137,120 @@ def get_training_run(run_id: str):
     with _get_conn() as conn:
         row = conn.execute("SELECT * FROM training_runs WHERE run_id = ?", (run_id,)).fetchone()
     return dict(row) if row else None
+
+
+# ── New: Rich run metadata for result persistence ─────────────────────────
+
+def update_run_results(
+    run_id: str,
+    ml_task: str = "",
+    target_column: str = "",
+    feature_columns: list[str] | None = None,
+    best_model_id: str = "",
+    best_algorithm: str = "",
+    primary_metric: str = "",
+    best_metric_value: float = 0.0,
+    model_count: int = 0,
+    dataset_filename: str = "",
+    run_type: str = "training",
+):
+    """Update training run with full result metadata after completion."""
+    features_json = json.dumps(feature_columns or [])
+    with _get_conn() as conn:
+        conn.execute(
+            """UPDATE training_runs
+               SET ml_task = ?, target_column = ?, feature_columns = ?,
+                   best_model_id = ?, best_algorithm = ?,
+                   primary_metric = ?, best_metric_value = ?,
+                   model_count = ?, dataset_filename = ?, run_type = ?,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE run_id = ?""",
+            (
+                ml_task, target_column, features_json,
+                best_model_id, best_algorithm,
+                primary_metric, best_metric_value,
+                model_count, dataset_filename, run_type,
+                run_id,
+            ),
+        )
+
+
+def list_completed_runs() -> list[dict]:
+    """Get all completed training/clustering runs with metadata."""
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """SELECT run_id, dataset_id, status, ml_task, target_column,
+                      best_model_id, best_algorithm, primary_metric,
+                      best_metric_value, model_count, dataset_filename,
+                      run_type, created_at, updated_at
+               FROM training_runs
+               WHERE status = 'complete'
+               ORDER BY created_at DESC"""
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_runs_by_dataset(dataset_id: str) -> list[dict]:
+    """Find all training runs that used a specific dataset."""
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """SELECT run_id, dataset_id, status, ml_task, target_column,
+                      best_model_id, best_algorithm, primary_metric,
+                      best_metric_value, model_count, dataset_filename,
+                      run_type, created_at, updated_at
+               FROM training_runs
+               WHERE dataset_id = ? AND status = 'complete'
+               ORDER BY created_at DESC""",
+            (dataset_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_clustering_run(run_id: str, dataset_id: str):
+    """Insert a clustering run entry into training_runs."""
+    with _get_conn() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO training_runs
+               (run_id, dataset_id, config, status, run_type)
+               VALUES (?, ?, '{}', 'queued', 'clustering')""",
+            (run_id, dataset_id),
+        )
+
+
+def find_matching_run(
+    dataset_id: str,
+    ml_task: str,
+    target_column: str,
+    feature_columns: list[str],
+    run_type: str = "training",
+) -> dict | None:
+    """Find a previous completed run with the same config (dataset + task + target + features).
+    
+    This enables automatic cache hits: if the user trains the same dataset 
+    with the same config, we return the previous result instead of retraining.
+    """
+    features_sorted = json.dumps(sorted(feature_columns))
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """SELECT run_id, dataset_id, status, ml_task, target_column,
+                      feature_columns, best_model_id, best_algorithm,
+                      primary_metric, best_metric_value, model_count,
+                      dataset_filename, run_type, created_at
+               FROM training_runs
+               WHERE dataset_id = ? AND ml_task = ? AND target_column = ?
+                     AND run_type = ? AND status = 'complete'
+               ORDER BY created_at DESC""",
+            (dataset_id, ml_task, target_column, run_type),
+        ).fetchall()
+
+    for row in rows:
+        r = dict(row)
+        # Compare sorted feature lists for exact match
+        try:
+            stored_features = json.loads(r.get("feature_columns", "[]"))
+            if json.dumps(sorted(stored_features)) == features_sorted:
+                return r
+        except Exception:
+            continue
+    return None
+
