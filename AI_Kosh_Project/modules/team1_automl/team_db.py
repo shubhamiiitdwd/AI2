@@ -217,6 +217,16 @@ def save_clustering_run(run_id: str, dataset_id: str):
         )
 
 
+def prune_training_runs_before(cutoff_date: str) -> int:
+    """Delete rows where date(created_at) < cutoff_date (YYYY-MM-DD). Returns deleted row count."""
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM training_runs WHERE date(created_at) < date(?)",
+            (cutoff_date,),
+        )
+        return cur.rowcount
+
+
 def find_matching_run(
     dataset_id: str,
     ml_task: str,

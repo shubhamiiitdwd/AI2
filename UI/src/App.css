@@ -1,0 +1,70 @@
+/* ── App shell ───────────────────────────────────────────── */
+.app-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  transition: background 0.35s var(--ease-smooth, ease);
+}
+
+/* Dark mode layered mesh background */
+:root:not([data-theme="light"]) .app-container {
+  background:
+    radial-gradient(ellipse 70% 50% at  8%   3%, rgba(251,140,54,0.07)  0%, transparent 55%),
+    radial-gradient(ellipse 55% 45% at 92%  96%, rgba(56,189,248,0.07)  0%, transparent 55%),
+    radial-gradient(ellipse 50% 60% at 50%  50%, rgba(167,139,250,0.04) 0%, transparent 65%),
+    var(--bg-root, #04060f);
+}
+
+/* Light mode background */
+:root[data-theme="light"] .app-container {
+  background:
+    radial-gradient(ellipse 70% 50% at  8%   3%, rgba(251,140,54,0.06)  0%, transparent 55%),
+    radial-gradient(ellipse 55% 45% at 92%  96%, rgba(56,189,248,0.05)  0%, transparent 55%),
+    var(--bg-root, #f3f5fc);
+}
+
+.main-content {
+  flex: 1;
+  padding-bottom: 40px;
+}
+
+/* ── Page loading splash ─────────────────────────────────── */
+.page-splash {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  background: var(--bg-root, #04060f);
+  transition: opacity 0.4s ease, visibility 0.4s ease;
+}
+.page-splash.hidden {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+.page-splash-ring {
+  width: 44px;
+  height: 44px;
+  border: 2px solid rgba(251,140,54,0.2);
+  border-top-color: #fb8c36;
+  border-radius: 50%;
+  animation: splashSpin 0.75s linear infinite;
+}
+@keyframes splashSpin { to { transform: rotate(360deg); } }
+
+/* ── View entrance animation ─────────────────────────────── */
+.view-animate-in {
+  animation: vEnter 0.5s cubic-bezier(0.4,0,0.2,1) both;
+}
+@keyframes vEnter {
+  from { opacity: 0; transform: translateY(18px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Legacy class — kept for safety ─────────────────────── */
+.card-pattern { /* intentionally empty */ }
+

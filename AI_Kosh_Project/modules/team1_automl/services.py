@@ -667,7 +667,7 @@ async def _persist_training_result(run_id: str, run: dict, req, ds):
         all_metrics = {}
         aml = run.get("aml")
         frame = run.get("frame")
-        ml_task = result.get("ml_task", "")
+        ml_task = result.get("ml_task") or getattr(getattr(req, "ml_task", None), "value", None) or ""
         if aml and frame:
             try:
                 best_model = h2o_engine.get_best_model(aml)
@@ -738,18 +738,7 @@ async def _persist_training_result(run_id: str, run: dict, req, ds):
         if residuals_data:
             serializable_result["residuals"] = residuals_data
 
-        # Persist via the storage layer (Azure or local)
-        storage = storage_service.get_storage()
-        storage.save_training_result(run_id, _sanitize_for_json(serializable_result))
-
-        # Upload model binary to Azure (if in Azure mode)
-        saved_path = result.get("saved_model_path", "")
-        if saved_path:
-            model_path = Path(saved_path)
-            if model_path.exists():
-                storage.save_model_binary(run_id, model_path.name, str(model_path))
-
-        # Determine primary metric and its value
+        # Determine primary metric and its value (needed for DB + blob)
         primary_metric = ""
         best_metric_value = 0.0
         if all_metrics:
@@ -760,7 +749,7 @@ async def _persist_training_result(run_id: str, run: dict, req, ds):
             primary_metric = next((m for m in pref if m in all_metrics), next(iter(all_metrics), ""))
             best_metric_value = all_metrics.get(primary_metric, 0.0) or 0.0
 
-        # Enrich the DB row with result metadata
+        # Enrich SQLite first so history stays correct even if Azure/local blob upload fails
         team_db.update_run_results(
             run_id=run_id,
             ml_task=ml_task,
@@ -774,6 +763,16 @@ async def _persist_training_result(run_id: str, run: dict, req, ds):
             dataset_filename=ds.filename,
             run_type="training",
         )
+
+        # Persist JSON + model binary via storage layer (Azure or local)
+        storage = storage_service.get_storage()
+        storage.save_training_result(run_id, _sanitize_for_json(serializable_result))
+
+        saved_path = result.get("saved_model_path", "")
+        if saved_path:
+            model_path = Path(saved_path)
+            if model_path.exists():
+                storage.save_model_binary(run_id, model_path.name, str(model_path))
 
         logger.info(f"Training result persisted for run {run_id} ({len(lb)} models, metric={primary_metric}:{best_metric_value})")
 
@@ -1507,7 +1506,27 @@ async def _run_clustering(run_id: str):
         best_algo = result["best_algorithm"]
         best_score = result["best_metrics"]["composite_score"]
 
-        # Persist result + elbow to Azure/local storage
+        # Enrich SQLite first so /training/history stays correct even if blob upload fails (same order as training)
+        try:
+            team_db.save_clustering_run(run_id, req.dataset_id)
+            team_db.update_training_run(run_id, TrainingStatus.COMPLETE)
+            team_db.update_run_results(
+                run_id=run_id,
+                ml_task="clustering",
+                target_column="",
+                feature_columns=req.feature_columns,
+                best_model_id="",
+                best_algorithm=best_algo,
+                primary_metric="composite_score",
+                best_metric_value=best_score,
+                model_count=n_tested,
+                dataset_filename=ds.filename,
+                run_type="clustering",
+            )
+            logger.info(f"Clustering run metadata saved for {run_id}")
+        except Exception as e:
+            logger.warning(f"Failed to persist clustering run metadata for {run_id}: {e}")
+
         try:
             storage = storage_service.get_storage()
             full_clustering_data = {
@@ -1524,32 +1543,14 @@ async def _run_clustering(run_id: str):
             }
             storage.save_clustering_result(run_id, full_clustering_data)
 
-            # Also save elbow separately for backward compat
             persist_dir = PROCESSED_DATA_DIR / run_id
             persist_dir.mkdir(parents=True, exist_ok=True)
             with open(persist_dir / "clustering_elbow.json", "w") as f:
                 json.dump(run["elbow"], f)
 
-            # Enrich DB
-            team_db.save_clustering_run(run_id, req.dataset_id)
-            team_db.update_training_run(run_id, TrainingStatus.COMPLETE)
-            team_db.update_run_results(
-                run_id=run_id,
-                ml_task="clustering",
-                target_column="",
-                feature_columns=req.feature_columns,
-                best_model_id="",
-                best_algorithm=best_algo,
-                primary_metric="composite_score",
-                best_metric_value=best_score,
-                model_count=n_tested,
-                dataset_filename=ds.filename,
-                run_type="clustering",
-            )
-
-            logger.info(f"Clustering result persisted for {run_id}")
+            logger.info(f"Clustering result persisted to storage for {run_id}")
         except Exception as e:
-            logger.warning(f"Failed to persist clustering result: {e}")
+            logger.warning(f"Failed to persist clustering result to storage for {run_id}: {e}")
 
         await _clustering_broadcast(
             run_id, 100,
@@ -1684,6 +1685,14 @@ async def clustering_websocket(websocket: WebSocket, run_id: str):
 # ═══════════════════════════════════════════════════════════════════════════
 # Training History & Persistence Endpoints
 # ═══════════════════════════════════════════════════════════════════════════
+
+def maybe_prune_training_history_at_startup() -> int:
+    """Optional DB cleanup: see config.TRAINING_HISTORY_PRUNE_BEFORE."""
+    from .config import TRAINING_HISTORY_PRUNE_BEFORE
+    if not TRAINING_HISTORY_PRUNE_BEFORE:
+        return 0
+    return team_db.prune_training_runs_before(TRAINING_HISTORY_PRUNE_BEFORE)
+
 
 async def list_training_history() -> TrainingHistoryResponse:
     """Return all completed training/clustering runs from the DB."""

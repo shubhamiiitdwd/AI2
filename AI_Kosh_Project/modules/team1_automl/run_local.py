@@ -16,15 +16,25 @@ from dotenv import load_dotenv
 load_dotenv(project_root / ".env")
 
 import uvicorn
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from modules.team1_automl.router import router
+from modules.team1_automl import services as team1_services
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    team1_services.maybe_prune_training_history_at_startup()
+    yield
+
 
 app = FastAPI(
     title="AI Kosh - Team 1 AutoML (Local Test)",
     description="Independent test server for the AutoML Wizard module",
     version="1.1.0",
+    lifespan=_lifespan,
 )
 
 # Never use allow_origins=["*"] with allow_credentials=True — invalid CORS; browsers may block.

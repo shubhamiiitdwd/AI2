@@ -1,0 +1,39 @@
+{
+  "name": "ui-kosh",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:api": "cd ../AI_Kosh_Project && python -m modules.team1_automl.run_local",
+    "dev:all": "concurrently -k -n api,ui -c cyan,magenta \"npm run dev:api\" \"wait-on tcp:127.0.0.1:8099 && npm run dev\"",
+    "build": "vite build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.96.0",
+    "axios": "^1.15.0",
+    "lucide-react": "^1.7.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-router-dom": "^7.13.2",
+    "recharts": "^3.8.1",
+    "sonner": "^2.0.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@types/node": "^24.12.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "eslint": "^9.39.4",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "concurrently": "^9.2.1",
+    "globals": "^17.4.0",
+    "typescript": "^6.0.2",
+    "vite": "^8.0.1",
+    "wait-on": "^9.0.5"
+  }
+}

@@ -16,6 +16,7 @@ dist-ssr/
 *.env.local
 AI_Kosh_Project/.env
 UI_kosh/.env
+UI/.env
 
 # Root documentation / assets not part of app publish (AI_Kosh_Project + UI_kosh only)
 /AIKoshBackendCodeStructure.docx
