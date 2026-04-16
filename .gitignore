@@ -73,3 +73,13 @@ npm-debug.log*
 !UI/dist/**/*.gif
 !UI/dist/**/*.svg
 !UI/dist/**/*.bmp
+
+# UI source images (imports in TSX; overrides *.png etc. above)
+!UI/src/assets/
+!UI/src/assets/**
+!UI/src/assets/**/*.png
+!UI/src/assets/**/*.jpg
+!UI/src/assets/**/*.jpeg
+!UI/src/assets/**/*.gif
+!UI/src/assets/**/*.bmp
+!UI/src/assets/**/*.webp
