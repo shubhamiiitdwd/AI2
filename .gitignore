@@ -63,3 +63,13 @@ desktop.ini
 # Logs
 *.log
 npm-debug.log*
+
+# UI production build (versioned for static hosting; overrides dist/ + image ignores above)
+!UI/dist/
+!UI/dist/**
+!UI/dist/**/*.png
+!UI/dist/**/*.jpg
+!UI/dist/**/*.jpeg
+!UI/dist/**/*.gif
+!UI/dist/**/*.svg
+!UI/dist/**/*.bmp
