@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from .enums import MLTask, ModelType, TrainingStatus
 
@@ -130,6 +130,35 @@ class ResidualsResponse(BaseModel):
     model_id: str
     actual: list[float]
     predicted: list[float]
+    errors: list[float] = Field(default_factory=list)
+
+
+class ClassificationHoldoutRow(BaseModel):
+    actual: str
+    predicted: str
+    confidence: float
+    probabilities: dict = Field(default_factory=dict)
+    features: dict = Field(default_factory=dict)
+
+
+class RegressionHoldoutRow(BaseModel):
+    actual: float
+    predicted: float
+    error: float
+    features: dict = Field(default_factory=dict)
+
+
+class HoldoutEvaluationResponse(BaseModel):
+    run_id: str
+    model_id: str
+    train_ratio_config: float
+    test_ratio_config: float
+    train_rows: int
+    test_rows: int
+    train_fraction_actual: float = 0.0
+    test_fraction_actual: float = 0.0
+    classification_rows: list[ClassificationHoldoutRow] = Field(default_factory=list)
+    regression_rows: list[RegressionHoldoutRow] = Field(default_factory=list)
 
 
 class ExportResponse(BaseModel):
@@ -164,6 +193,7 @@ class GainsLiftRow(BaseModel):
 class GainsLiftResponse(BaseModel):
     run_id: str
     rows: list[GainsLiftRow]
+    note: str = ""
 
 
 class BestModelSummary(BaseModel):
@@ -316,4 +346,26 @@ class TrainingRunSummary(BaseModel):
 
 class TrainingHistoryResponse(BaseModel):
     runs: list[TrainingRunSummary]
+
+
+class DatasetWorkflowInsightResponse(BaseModel):
+    """Whether the CSV looks tabular for H2O AutoML / clustering vs raw text needing prep."""
+
+    is_structured_tabular: bool
+    needs_data_exchange: bool
+    suggest_automl: bool
+    headline: str
+    detail: str
+    source: str = "rules"
+
+
+class ClusteringLabeledPreviewResponse(BaseModel):
+    run_id: str
+    columns: list[str]
+    rows: list[dict]
+
+
+class TextInsightResponse(BaseModel):
+    text: str
+    source: str = "rules"
 

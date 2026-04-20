@@ -110,6 +110,26 @@ export interface TrainingHistoryResponse {
   runs: TrainingRunSummary[];
 }
 
+export interface DatasetWorkflowInsightResponse {
+  is_structured_tabular: boolean;
+  needs_data_exchange: boolean;
+  suggest_automl: boolean;
+  headline: string;
+  detail: string;
+  source?: string;
+}
+
+export interface ClusteringLabeledPreviewResponse {
+  run_id: string;
+  columns: string[];
+  rows: Record<string, unknown>[];
+}
+
+export interface TextInsightResponse {
+  text: string;
+  source?: string;
+}
+
 export interface ModelResult {
   model_id: string;
   algorithm: string;
@@ -143,6 +163,35 @@ export interface ResidualsResponse {
   model_id: string;
   actual: number[];
   predicted: number[];
+  errors?: number[];
+}
+
+export interface ClassificationHoldoutRow {
+  actual: string;
+  predicted: string;
+  confidence: number;
+  probabilities?: Record<string, number>;
+  features?: Record<string, unknown>;
+}
+
+export interface RegressionHoldoutRow {
+  actual: number;
+  predicted: number;
+  error: number;
+  features?: Record<string, unknown>;
+}
+
+export interface HoldoutEvaluationResponse {
+  run_id: string;
+  model_id: string;
+  train_ratio_config: number;
+  test_ratio_config: number;
+  train_rows: number;
+  test_rows: number;
+  train_fraction_actual: number;
+  test_fraction_actual: number;
+  classification_rows: ClassificationHoldoutRow[];
+  regression_rows: RegressionHoldoutRow[];
 }
 
 export type MLTask = 'classification' | 'regression' | 'clustering';

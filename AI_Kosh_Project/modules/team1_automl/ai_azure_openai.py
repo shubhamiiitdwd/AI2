@@ -300,3 +300,88 @@ async def suggest_usecases(
     if not suggestions:
         raise ValueError("Azure OpenAI returned no valid suggestions")
     return suggestions
+
+
+async def dataset_workflow_insight(
+    columns: list[ColumnInfo],
+    filename: str,
+    total_rows: int,
+    total_cols: int,
+) -> dict:
+    """Return flags + copy for dataset step (tabular vs raw). Must match JSON keys used in services."""
+    client = _get_client()
+    col_desc = "\n".join(
+        f"- {c.name} ({c.dtype}, nulls={c.null_count}, unique={c.unique_count}, samples={c.sample_values[:3]!s})"
+        for c in columns[:40]
+    )
+    response = await client.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You assess CSV structure for ML pipelines. "
+                    "Structured tabular = multiple columns suitable for H2O AutoML or clustering (numeric and/or "
+                    "categorical with reasonable cardinality). Raw/unstructured = free text blobs, logs, single "
+                    "unparsed text column, or mostly long-text fields needing feature engineering. "
+                    "Return ONLY JSON: "
+                    '{"needs_data_exchange": bool, "is_structured_tabular": bool, "suggest_automl": bool, '
+                    '"headline": "short title", "detail": "2-4 sentences with next steps"}'
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"File: {filename}, rows={total_rows}, columns={total_cols}.\n\n{col_desc}\n\n"
+                    "If raw/unstructured, say to use Data Exchange for cleaning and feature engineering, then AutoML. "
+                    "If tabular, recommend AutoML or clustering."
+                ),
+            },
+        ],
+        max_tokens=400,
+        temperature=0.3,
+    )
+    text = response.choices[0].message.content.strip()
+    data = _parse_json_response(text)
+    return {
+        "needs_data_exchange": bool(data.get("needs_data_exchange")),
+        "is_structured_tabular": bool(data.get("is_structured_tabular")),
+        "suggest_automl": bool(data.get("suggest_automl", data.get("is_structured_tabular"))),
+        "headline": str(data.get("headline", "")).strip(),
+        "detail": str(data.get("detail", "")).strip(),
+    }
+
+
+async def clustering_elbow_insight(
+    best_algorithm: str,
+    best_n_clusters: int,
+    recommended_kmeans_k: int,
+    leaderboard_summary: str,
+) -> str:
+    """Short narrative explaining elbow vs global best model (KMeans vs other algos)."""
+    client = _get_client()
+    response = await client.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You explain clustering methodology clearly in 2–5 sentences. Mention that the elbow chart "
+                    "and silhouette for KMeans across K=2..10 is only a guide, while the leaderboard scores "
+                    "KMeans, GMM, and DBSCAN together — so the best model's K can differ from the elbow heuristic. "
+                    "Reassure this is expected, not a bug. Be concise."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Best leaderboard model: {best_algorithm} with n_clusters={best_n_clusters}. "
+                    f"KMeans elbow heuristic suggested K={recommended_kmeans_k}. "
+                    f"Leaderboard excerpt: {leaderboard_summary}"
+                ),
+            },
+        ],
+        max_tokens=220,
+        temperature=0.35,
+    )
+    return (response.choices[0].message.content or "").strip()

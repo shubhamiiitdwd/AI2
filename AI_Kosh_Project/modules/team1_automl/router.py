@@ -8,13 +8,16 @@ from .schemas import (
     ValidateConfigRequest, ValidateConfigResponse,
     TrainingStartRequest, TrainingStartResponse, TrainingStatusResponse,
     LeaderboardResponse, FeatureImportanceResponse,
-    ConfusionMatrixResponse, ResidualsResponse, ExportResponse,
+    ConfusionMatrixResponse, ResidualsResponse, HoldoutEvaluationResponse, ExportResponse,
     UseCaseSuggestionsResponse, AutoDetectTaskResponse,
     PredictRequest, PredictResponse, GainsLiftResponse, AISummaryResponse,
     HFDatasetInfo, HFImportRequest,
     ClusteringStartRequest, ClusteringStartResponse,
     ClusteringResultResponse, ElbowResponse,
     TrainingHistoryResponse,
+    DatasetWorkflowInsightResponse,
+    ClusteringLabeledPreviewResponse,
+    TextInsightResponse,
 )
 from . import services
 from . import hf_datasets
@@ -56,6 +59,11 @@ async def get_columns(dataset_id: str):
     return await services.get_dataset_columns(dataset_id)
 
 
+@router.get("/datasets/{dataset_id}/workflow-insight", response_model=DatasetWorkflowInsightResponse)
+async def dataset_workflow_insight(dataset_id: str):
+    return await services.get_dataset_workflow_insight(dataset_id)
+
+
 @router.delete("/datasets/{dataset_id}")
 async def delete_dataset(dataset_id: str):
     return await services.delete_dataset(dataset_id)
@@ -92,8 +100,8 @@ async def start_training(req: TrainingStartRequest):
 
 # History routes must come before {run_id} wildcard routes
 @router.get("/training/history", response_model=TrainingHistoryResponse)
-async def list_training_history():
-    return await services.list_training_history()
+async def list_training_history(limit: Optional[int] = Query(default=None, le=5000)):
+    return await services.list_training_history(limit=limit)
 
 
 @router.get("/training/history/{dataset_id}", response_model=TrainingHistoryResponse)
@@ -143,6 +151,21 @@ async def get_residuals(run_id: str):
     return await services.get_residuals(run_id)
 
 
+@router.get("/results/{run_id}/holdout-evaluation", response_model=HoldoutEvaluationResponse)
+async def get_holdout_evaluation(run_id: str):
+    return await services.get_holdout_evaluation(run_id)
+
+
+@router.get("/results/{run_id}/holdout-predictions.csv")
+async def export_holdout_predictions_csv(run_id: str):
+    return await services.export_holdout_predictions_csv(run_id)
+
+
+@router.get("/results/{run_id}/holdout-regression-predictions.csv")
+async def export_holdout_regression_predictions_csv(run_id: str):
+    return await services.export_holdout_regression_predictions_csv(run_id)
+
+
 @router.get("/results/{run_id}/export")
 async def export_results(run_id: str, format: str = Query(default="csv")):
     return await services.export_results(run_id, format)
@@ -188,6 +211,21 @@ async def clustering_result(run_id: str):
 @router.get("/clustering/{run_id}/elbow", response_model=ElbowResponse)
 async def clustering_elbow(run_id: str):
     return await services.get_elbow_analysis(run_id)
+
+
+@router.get("/clustering/{run_id}/elbow-insight", response_model=TextInsightResponse)
+async def clustering_elbow_insight(run_id: str):
+    return await services.get_clustering_elbow_insight(run_id)
+
+
+@router.get("/clustering/{run_id}/labeled-preview", response_model=ClusteringLabeledPreviewResponse)
+async def clustering_labeled_preview(run_id: str, rows: int = Query(default=10, le=50), cols: int = Query(default=10, le=50)):
+    return await services.get_clustering_labeled_preview(run_id, max_rows=rows, max_cols=cols)
+
+
+@router.get("/clustering/{run_id}/labeled-export.csv")
+async def clustering_labeled_export_csv(run_id: str):
+    return await services.export_clustering_labeled_csv(run_id)
 
 
 @router.websocket("/ws/clustering/{run_id}")

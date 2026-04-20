@@ -67,7 +67,7 @@ export default function Dashboard({ onStartProject, onOpenRunResults }: Props) {
 
   const loadStats = useCallback(async () => {
     try {
-      const history = await getTrainingHistory().catch(() => ({ runs: [] as TrainingRunSummary[] }));
+      const history = await getTrainingHistory(400).catch(() => ({ runs: [] as TrainingRunSummary[] }));
       const fromYmd = STATS_FROM_YMD;
       setStatsPeriodLabel(formatYmdReadable(fromYmd));
 

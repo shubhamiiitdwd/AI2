@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import UploadFile, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from .config import (
     STORAGE_MODE, AI_MODE, RAW_UPLOADS_DIR, MODELS_DIR, PROCESSED_DATA_DIR,
@@ -26,6 +26,7 @@ from .schemas import (
     TrainingStartRequest, TrainingStartResponse, TrainingStatusResponse,
     LeaderboardResponse, ModelResult, FeatureImportanceResponse,
     ConfusionMatrixResponse, ResidualsResponse, ExportResponse, ColumnInfo,
+    HoldoutEvaluationResponse, ClassificationHoldoutRow, RegressionHoldoutRow,
     UseCaseSuggestion, UseCaseSuggestionsResponse,
     PredictRequest, PredictResponse, PredictionModelResult,
     GainsLiftResponse, GainsLiftRow,
@@ -36,6 +37,9 @@ from .schemas import (
     CandidateModelResult, ClusterSummary, ClusterFeatureImportance,
     DimensionReductionPoint, ElbowResponse, ElbowDataPoint,
     TrainingRunSummary, TrainingHistoryResponse,
+    DatasetWorkflowInsightResponse,
+    ClusteringLabeledPreviewResponse,
+    TextInsightResponse,
 )
 from .enums import MLTask, TrainingStatus
 from . import data_processor
@@ -76,6 +80,114 @@ def _sanitize_for_json(obj):
         if math.isnan(obj) or math.isinf(obj):
             return None
     return obj
+
+
+def _rule_dataset_workflow_insight(
+    columns: list[ColumnInfo],
+    filename: str,
+    total_rows: int,
+    total_cols: int,
+) -> DatasetWorkflowInsightResponse:
+    """Heuristic tabular vs raw/unstructured when Azure OpenAI is unavailable."""
+    if not columns:
+        return DatasetWorkflowInsightResponse(
+            is_structured_tabular=False,
+            needs_data_exchange=True,
+            suggest_automl=False,
+            headline="No column metadata",
+            detail="Upload a CSV with readable headers. If this is raw text or logs, use Data Exchange to parse features first.",
+            source="rules",
+        )
+
+    n_num = sum(1 for c in columns if (c.dtype or "") in ("int64", "float64", "int32", "float32"))
+    n_obj = sum(1 for c in columns if "object" in (c.dtype or "") or c.dtype == "object")
+
+    long_text_cols = 0
+    for c in columns:
+        sv = c.sample_values or []
+        if not sv:
+            continue
+        lens = [len(str(v)) for v in sv[:5]]
+        if lens and sum(lens) / len(lens) > 100:
+            long_text_cols += 1
+
+    single_text_blob = total_cols == 1 and n_obj >= 1
+    mostly_long_text = long_text_cols >= max(2, (total_cols + 1) // 2) and n_num == 0
+    sparse_types = total_cols >= 2 and n_num == 0 and n_obj == total_cols
+
+    needs_exchange = single_text_blob or mostly_long_text or (sparse_types and long_text_cols >= 1)
+
+    structured = (
+        not needs_exchange
+        and total_cols >= 2
+        and (n_num >= 1 or (n_obj >= 2 and all(c.unique_count <= max(100, total_rows // 3) for c in columns)))
+    )
+
+    if needs_exchange:
+        return DatasetWorkflowInsightResponse(
+            is_structured_tabular=False,
+            needs_data_exchange=True,
+            suggest_automl=False,
+            headline="Dataset looks unstructured or needs feature engineering",
+            detail=(
+                "Columns look like free text, a single unparsed field, or lack numeric/categorical structure for AutoML. "
+                "Use Data Exchange to clean, parse, and engineer features, then return here for AutoML or clustering."
+            ),
+            source="rules",
+        )
+
+    if structured:
+        return DatasetWorkflowInsightResponse(
+            is_structured_tabular=True,
+            needs_data_exchange=False,
+            suggest_automl=True,
+            headline="Structured tabular data detected",
+            detail=(
+                f"'{filename}' has {total_cols} columns with types suitable for H2O AutoML or clustering. "
+                "Continue with Configure Data, pick a target (for supervised tasks), and run AutoML—or choose Clustering for unsupervised exploration."
+            ),
+            source="rules",
+        )
+
+    return DatasetWorkflowInsightResponse(
+        is_structured_tabular=True,
+        needs_data_exchange=False,
+        suggest_automl=True,
+        headline="Likely tabular — review columns in the next step",
+        detail="This CSV is probably usable for AutoML or clustering. If any column is raw text, drop or transform it before training.",
+        source="rules",
+    )
+
+
+async def get_dataset_workflow_insight(dataset_id: str) -> DatasetWorkflowInsightResponse:
+    ds = team_db.get_dataset(dataset_id)
+    if not ds:
+        raise HTTPException(404, "Dataset not found")
+    storage = storage_service.get_storage()
+    filepath = storage.get_dataset_path(dataset_id, ds.filename)
+    cols_resp = data_processor.get_columns(filepath, dataset_id)
+    columns = cols_resp.columns
+    base = _rule_dataset_workflow_insight(columns, ds.filename, ds.total_rows, ds.total_columns)
+
+    if AI_MODE != "azure":
+        return base
+
+    try:
+        ai = ai_service.get_ai_service()
+        if not hasattr(ai, "dataset_workflow_insight"):
+            return base
+        data = await ai.dataset_workflow_insight(columns, ds.filename, ds.total_rows, ds.total_columns)
+        return DatasetWorkflowInsightResponse(
+            is_structured_tabular=bool(data.get("is_structured_tabular", base.is_structured_tabular)),
+            needs_data_exchange=bool(data.get("needs_data_exchange", base.needs_data_exchange)),
+            suggest_automl=bool(data.get("suggest_automl", base.suggest_automl)),
+            headline=data.get("headline") or base.headline,
+            detail=data.get("detail") or base.detail,
+            source="azure",
+        )
+    except Exception as e:
+        logger.debug("dataset_workflow_insight Azure fallback: %s", e)
+        return base
 
 
 async def upload_dataset(file: UploadFile) -> DatasetMetadata:
@@ -512,8 +624,18 @@ async def _run_training(run_id: str):
         filepath = storage.get_dataset_path(req.dataset_id, ds.filename)
         frame = h2o_engine.load_dataset(str(filepath))
         run["frame"] = frame
+        train_frame, test_frame = h2o_engine.split_train_holdout(frame, req.train_test_split, seed=42)
+        run["train_frame"] = train_frame
+        run["test_frame"] = test_frame
 
-        await _update_run(run_id, TrainingStatus.FEATURES, 20, f"Loaded {frame.nrows} rows, {frame.ncols} columns")
+        await _update_run(
+            run_id,
+            TrainingStatus.FEATURES,
+            20,
+            f"Loaded {frame.nrows} rows, {frame.ncols} columns — "
+            f"train {train_frame.nrows} ({float(req.train_test_split) * 100:.0f}%) / "
+            f"holdout test {test_frame.nrows} ({(1 - float(req.train_test_split)) * 100:.0f}%)",
+        )
 
         models_list = [m.value for m in req.models] if req.models else None
 
@@ -521,7 +643,7 @@ async def _run_training(run_id: str):
         aml = await loop.run_in_executor(
             None,
             lambda: h2o_engine.setup_automl(
-                frame=frame,
+                frame=train_frame,
                 target=req.target_column,
                 ml_task=req.ml_task.value,
                 include_algos=models_list,
@@ -549,7 +671,7 @@ async def _run_training(run_id: str):
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         future = executor.submit(
-            h2o_engine.train_automl, aml, req.feature_columns, req.target_column, frame
+            h2o_engine.train_automl, aml, req.feature_columns, req.target_column, train_frame
         )
 
         heartbeat_progress = 31
@@ -656,6 +778,32 @@ async def _run_training(run_id: str):
         await _persist_training_result(run_id, run, run["request"], run["dataset"])
 
 
+def _h2o_selection_metrics_from_best(best, ml_task: str, n_target_classes: int) -> dict:
+    """Leaderboard / CV metrics only (H2O AutoML) — never holdout sklearn."""
+    if not best:
+        return {}
+    metrics = best.metrics if isinstance(best, ModelResult) else (best.get("metrics") or {})
+    out: dict[str, float] = {}
+    if ml_task == "classification":
+        pref = ["auc", "logloss"] if n_target_classes <= 2 else ["mean_per_class_error", "logloss", "auc"]
+    else:
+        pref = ["mean_residual_deviance", "rmse", "mae"]
+    for k in pref:
+        if k not in metrics or metrics[k] is None:
+            continue
+        try:
+            fv = float(metrics[k])
+            if math.isnan(fv) or math.isinf(fv):
+                continue
+            prec = 8 if k == "logloss" else 6
+            out[k] = round(fv, prec)
+        except (TypeError, ValueError):
+            continue
+    if "mean_residual_deviance" in out:
+        out["deviance"] = out["mean_residual_deviance"]
+    return out
+
+
 async def _persist_training_result(run_id: str, run: dict, req, ds):
     """Persist full training result to Azure/local storage + enrich DB metadata."""
     try:
@@ -663,51 +811,180 @@ async def _persist_training_result(run_id: str, run: dict, req, ds):
         lb = result.get("leaderboard", [])
         best = next((m for m in lb if m.is_best), None) if lb else None
 
-        # Gather all_metrics for persistence
-        all_metrics = {}
+        n_cls = int(run.get("n_target_classes", 2))
+        selection_metrics: dict = _h2o_selection_metrics_from_best(best, result.get("ml_task") or "", n_cls)
+        validation_metrics: dict = {}
+        all_metrics: dict = dict(selection_metrics)
+        metrics_eval_set = "train"
+        metrics_eval_rows = 0
         aml = run.get("aml")
         frame = run.get("frame")
+        train_frame = run.get("train_frame") or frame
+        test_frame = run.get("test_frame")
         ml_task = result.get("ml_task") or getattr(getattr(req, "ml_task", None), "value", None) or ""
-        if aml and frame:
-            try:
-                best_model = h2o_engine.get_best_model(aml)
-                raw_metrics = h2o_engine.get_model_metrics(best_model, frame, ml_task, req.target_column)
-                for k, v in raw_metrics.items():
-                    if v is not None:
-                        try:
-                            fv = float(v)
-                            if not (math.isnan(fv) or math.isinf(fv)):
-                                all_metrics[k] = fv
-                        except (ValueError, TypeError):
-                            pass
-            except Exception:
-                pass
-
-        if not all_metrics and best:
-            all_metrics = {k: v for k, v in best.metrics.items() if k != "model_id" and v is not None}
-
-        # Gather confusion matrix for classification tasks
         confusion_matrix_data = None
-        if ml_task == "classification" and aml and frame:
+        residuals_data = None
+        holdout_evaluation = None
+
+        if aml and train_frame:
             try:
                 best_model = h2o_engine.get_best_model(aml)
-                cm_data = h2o_engine.get_confusion_matrix(best_model, frame)
-                if cm_data:
-                    confusion_matrix_data = cm_data
+                use_test = (
+                    test_frame is not None
+                    and int(test_frame.nrows) > 0
+                )
+                eval_frame = test_frame if use_test else train_frame
+                metrics_eval_set = "holdout" if use_test else "train"
+                metrics_eval_rows = int(eval_frame.nrows) if eval_frame is not None else 0
+
+                if ml_task == "classification":
+                    m, cm_data, cls_rows = h2o_engine.evaluate_classification_frame(
+                        best_model,
+                        eval_frame,
+                        req.target_column,
+                        max_detail_rows=10,
+                        feature_columns=req.feature_columns,
+                    )
+                    for k, v in m.items():
+                        if v is not None:
+                            try:
+                                fv = float(v)
+                                if not (math.isnan(fv) or math.isinf(fv)):
+                                    validation_metrics[k] = fv
+                            except (ValueError, TypeError):
+                                pass
+                    if cm_data and cm_data.get("labels"):
+                        confusion_matrix_data = cm_data
+                    tr_n = int(train_frame.nrows) if train_frame is not None else 0
+                    te_n = int(test_frame.nrows) if test_frame is not None else 0
+                    tot = tr_n + te_n
+                    holdout_evaluation = {
+                        "train_ratio_config": float(req.train_test_split),
+                        "test_ratio_config": round(1.0 - float(req.train_test_split), 6),
+                        "train_rows": tr_n,
+                        "test_rows": te_n,
+                        "train_fraction_actual": round(tr_n / tot, 6) if tot else 0.0,
+                        "test_fraction_actual": round(te_n / tot, 6) if tot else 0.0,
+                        "classification_rows": cls_rows,
+                    }
+                elif ml_task == "regression":
+                    _m, reg_rows_full = h2o_engine.evaluate_regression_frame(
+                        best_model,
+                        eval_frame,
+                        req.target_column,
+                        feature_columns=req.feature_columns,
+                        max_detail_rows=10,
+                    )
+                    reg_rows = reg_rows_full
+                    act = [r["actual"] for r in reg_rows_full]
+                    prd = [r["predicted"] for r in reg_rows_full]
+                    residuals_data = {
+                        "actual": act,
+                        "predicted": prd,
+                        "errors": [round(float(act[i]) - float(prd[i]), 8) for i in range(min(len(act), len(prd)))],
+                    }
+                    tr_n = int(train_frame.nrows) if train_frame is not None else 0
+                    te_n = int(test_frame.nrows) if test_frame is not None else 0
+                    tot = tr_n + te_n
+                    holdout_evaluation = {
+                        "train_ratio_config": float(req.train_test_split),
+                        "test_ratio_config": round(1.0 - float(req.train_test_split), 6),
+                        "train_rows": tr_n,
+                        "test_rows": te_n,
+                        "train_fraction_actual": round(tr_n / tot, 6) if tot else 0.0,
+                        "test_fraction_actual": round(te_n / tot, 6) if tot else 0.0,
+                        "regression_rows": reg_rows,
+                    }
+                else:
+                    raw_metrics = h2o_engine.get_model_metrics(
+                        best_model, train_frame, ml_task, req.target_column, eval_frame=eval_frame
+                    )
+                    for k, v in raw_metrics.items():
+                        if v is not None:
+                            try:
+                                fv = float(v)
+                                if not (math.isnan(fv) or math.isinf(fv)):
+                                    all_metrics[k] = fv
+                            except (ValueError, TypeError):
+                                pass
             except Exception:
                 pass
 
-        # Gather residuals for regression tasks
-        residuals_data = None
-        if ml_task == "regression" and aml and frame:
+        if not selection_metrics and best:
+            raw_sel = {k: v for k, v in best.metrics.items() if k != "model_id" and v is not None}
+            selection_metrics = dict(raw_sel)
+            all_metrics = dict(selection_metrics)
+
+        gains_lift_rows: list = []
+        gains_lift_note = ""
+        if ml_task == "classification" and aml and train_frame is not None:
             try:
                 best_model = h2o_engine.get_best_model(aml)
-                preds = best_model.predict(frame)
-                pred_col = preds.as_data_frame().iloc[:, 0].tolist()
-                actual_col = frame[req.target_column].as_data_frame().iloc[:, 0].tolist()
-                residuals_data = {
-                    "actual": actual_col[:500],
-                    "predicted": pred_col[:500],
+                if h2o_engine.model_is_binomial(best_model):
+                    gains_lift_rows = h2o_engine.get_gains_lift(best_model, train_frame)
+                    if not gains_lift_rows and frame is not None and int(frame.nrows) > int(train_frame.nrows):
+                        gains_lift_rows = h2o_engine.get_gains_lift(best_model, frame)
+                        if gains_lift_rows:
+                            gains_lift_note = (
+                                "Deciles computed on the full imported dataset (before train/holdout split) "
+                                "because the post-split training slice was too small for stable deciles."
+                            )
+                    if not gains_lift_rows:
+                        gains_lift_note = (
+                            "Gains/lift deciles were empty — common with very small training sets after the train/holdout split."
+                        )
+                else:
+                    gains_lift_note = (
+                        "Gains/lift charts are only available for binary classification in H2O. "
+                        "This task is multiclass, so decile lift is not shown."
+                    )
+            except Exception as e:
+                gains_lift_note = f"Gains/lift could not be computed: {str(e)[:180]}"
+
+        if ml_task == "classification" and aml and test_frame is not None and int(test_frame.nrows) > 0:
+            try:
+                bm_csv = h2o_engine.get_best_model(aml)
+                out_csv = PROCESSED_DATA_DIR / run_id / "holdout_predictions.csv"
+                out_csv.parent.mkdir(parents=True, exist_ok=True)
+                h2o_engine.write_classification_holdout_csv(
+                    bm_csv,
+                    test_frame,
+                    req.target_column,
+                    list(req.feature_columns or []),
+                    str(out_csv),
+                )
+            except Exception as e:
+                logger.debug("holdout csv export: %s", e)
+
+        if ml_task == "regression" and aml and test_frame is not None and int(test_frame.nrows) > 0:
+            try:
+                bm_reg = h2o_engine.get_best_model(aml)
+                out_reg = PROCESSED_DATA_DIR / run_id / "holdout_regression_predictions.csv"
+                out_reg.parent.mkdir(parents=True, exist_ok=True)
+                h2o_engine.write_regression_holdout_csv(
+                    bm_reg,
+                    test_frame,
+                    req.target_column,
+                    list(req.feature_columns or []),
+                    str(out_reg),
+                )
+            except Exception as e:
+                logger.debug("holdout regression csv export: %s", e)
+
+        if holdout_evaluation is None:
+            try:
+                tr_n = int(train_frame.nrows) if train_frame is not None else 0
+                te_n = int(test_frame.nrows) if test_frame is not None else 0
+                tot = tr_n + te_n
+                holdout_evaluation = {
+                    "train_ratio_config": float(req.train_test_split),
+                    "test_ratio_config": round(1.0 - float(req.train_test_split), 6),
+                    "train_rows": tr_n,
+                    "test_rows": te_n,
+                    "train_fraction_actual": round(tr_n / tot, 6) if tot else 0.0,
+                    "test_fraction_actual": round(te_n / tot, 6) if tot else 0.0,
+                    "classification_rows": [],
+                    "regression_rows": [],
                 }
             except Exception:
                 pass
@@ -720,6 +997,10 @@ async def _persist_training_result(run_id: str, run: dict, req, ds):
             "feature_importance": result.get("feature_importance", []),
             "best_model_id": best.model_id if best else "",
             "all_metrics": all_metrics,
+            "selection_metrics": selection_metrics,
+            "validation_metrics": validation_metrics,
+            "metrics_eval_set": metrics_eval_set,
+            "metrics_eval_rows": metrics_eval_rows,
             "config": {
                 "dataset_id": req.dataset_id,
                 "dataset_filename": ds.filename,
@@ -729,6 +1010,7 @@ async def _persist_training_result(run_id: str, run: dict, req, ds):
                 "max_models": req.max_models,
                 "max_runtime_secs": req.max_runtime_secs,
                 "nfolds": req.nfolds,
+                "train_test_split": float(req.train_test_split),
             },
             "n_target_classes": run.get("n_target_classes", 2),
             "created_at": run.get("started_at", datetime.now().isoformat()),
@@ -737,17 +1019,22 @@ async def _persist_training_result(run_id: str, run: dict, req, ds):
             serializable_result["confusion_matrix"] = confusion_matrix_data
         if residuals_data:
             serializable_result["residuals"] = residuals_data
+        if holdout_evaluation:
+            serializable_result["holdout_evaluation"] = holdout_evaluation
+        if ml_task == "classification":
+            serializable_result["gains_lift"] = gains_lift_rows
+            serializable_result["gains_lift_note"] = gains_lift_note
 
         # Determine primary metric and its value (needed for DB + blob)
         primary_metric = ""
         best_metric_value = 0.0
-        if all_metrics:
+        if selection_metrics:
             if ml_task == "classification":
-                pref = ["auc", "accuracy", "logloss", "mean_per_class_error"]
+                pref = ["auc", "logloss", "mean_per_class_error"]
             else:
-                pref = ["rmse", "mae", "r2", "mean_residual_deviance"]
-            primary_metric = next((m for m in pref if m in all_metrics), next(iter(all_metrics), ""))
-            best_metric_value = all_metrics.get(primary_metric, 0.0) or 0.0
+                pref = ["mean_residual_deviance", "deviance", "rmse", "mae"]
+            primary_metric = next((m for m in pref if m in selection_metrics), next(iter(selection_metrics), ""))
+            best_metric_value = selection_metrics.get(primary_metric, 0.0) or 0.0
 
         # Enrich SQLite first so history stays correct even if Azure/local blob upload fails
         team_db.update_run_results(
@@ -763,6 +1050,25 @@ async def _persist_training_result(run_id: str, run: dict, req, ds):
             dataset_filename=ds.filename,
             run_type="training",
         )
+
+        # Merge evaluation artifacts into in-memory result so APIs work before restart
+        if run:
+            r = run.setdefault("result", {})
+            r["all_metrics"] = serializable_result.get("all_metrics", {})
+            r["config"] = serializable_result.get("config", {})
+            for opt in (
+                "confusion_matrix",
+                "residuals",
+                "holdout_evaluation",
+                "gains_lift",
+                "gains_lift_note",
+                "metrics_eval_set",
+                "metrics_eval_rows",
+                "selection_metrics",
+                "validation_metrics",
+            ):
+                if opt in serializable_result:
+                    r[opt] = serializable_result[opt]
 
         # Persist JSON + model binary via storage layer (Azure or local)
         storage = storage_service.get_storage()
@@ -842,7 +1148,10 @@ async def training_websocket(websocket: WebSocket, run_id: str):
         run = _active_runs.get(run_id)
         if run:
             for log in run["logs"]:
-                await websocket.send_json(log)
+                try:
+                    await websocket.send_json(log)
+                except WebSocketDisconnect:
+                    return
 
         while True:
             try:
@@ -850,13 +1159,16 @@ async def training_websocket(websocket: WebSocket, run_id: str):
             except asyncio.TimeoutError:
                 run = _active_runs.get(run_id)
                 if run and run["status"] in (TrainingStatus.COMPLETE, TrainingStatus.FAILED, TrainingStatus.STOPPED):
-                    await websocket.send_json({
-                        "status": run["status"].value,
-                        "progress": run["progress"],
-                        "stage": run["stage"],
-                        "message": "done",
-                        "timestamp": datetime.now().isoformat(),
-                    })
+                    try:
+                        await websocket.send_json({
+                            "status": run["status"].value,
+                            "progress": run["progress"],
+                            "stage": run["stage"],
+                            "message": "done",
+                            "timestamp": datetime.now().isoformat(),
+                        })
+                    except WebSocketDisconnect:
+                        pass
                     break
             except WebSocketDisconnect:
                 break
@@ -929,13 +1241,14 @@ async def get_leaderboard(run_id: str) -> LeaderboardResponse:
         metric_keys = list(first.metrics.keys()) if isinstance(first, ModelResult) else list((first.get("metrics") or {}).keys())
 
     ml_task = result.get("ml_task", "classification")
-    target_classes = run.get("n_target_classes", 2) if run else 2
+    _ntc = result.get("n_target_classes")
+    target_classes = int(_ntc) if _ntc is not None else int(run.get("n_target_classes", 2) if run else 2)
 
     if ml_task == "classification":
         if target_classes <= 2:
-            pref = ["auc", "logloss", "mean_per_class_error", "accuracy"]
+            pref = ["auc", "logloss", "mean_per_class_error"]
         else:
-            pref = ["mean_per_class_error", "logloss", "auc", "accuracy"]
+            pref = ["mean_per_class_error", "logloss", "auc"]
     else:
         pref = ["mean_residual_deviance", "rmse", "mae", "mse", "rmsle", "r2"]
 
@@ -968,46 +1281,106 @@ async def get_best_model(run_id: str):
         target_column = result["config"].get("target_column", "")
         feature_columns = result["config"].get("feature_columns", [])
 
-    # Persisted metrics first, then overlay live H2O (so PRF from storage is kept if live omits them)
-    all_metrics: dict = dict(result.get("all_metrics") or {})
+    ml_task_res = result.get("ml_task", "")
+    n_cls = int(result.get("n_target_classes", 2))
+
+    selection_metrics: dict = dict(result.get("selection_metrics") or {})
+    if not selection_metrics and best:
+        selection_metrics = _h2o_selection_metrics_from_best(best, ml_task_res, n_cls)
+    if not selection_metrics and best:
+        selection_metrics = {k: v for k, v in best.metrics.items() if k != "model_id" and v is not None}
+
+    validation_metrics: dict = dict(result.get("validation_metrics") or {})
+    if not validation_metrics and ml_task_res == "classification":
+        am = result.get("all_metrics") or {}
+        for k in ("precision", "recall", "f1"):
+            if k in am and am[k] is not None:
+                validation_metrics[k] = am[k]
+
+    metrics_eval_set = result.get("metrics_eval_set") or "train"
+    metrics_eval_rows = int(result.get("metrics_eval_rows") or 0)
+    evaluation_warnings: list[str] = []
+
     if run:
         aml = run.get("aml")
-        frame = run.get("frame")
-        if aml and frame:
+        train_frame = run.get("train_frame") or run.get("frame")
+        test_frame = run.get("test_frame")
+        use_test = test_frame is not None and int(test_frame.nrows) > 0
+        eval_frame = test_frame if use_test else train_frame
+        run_status = run.get("status")
+        training_done = run_status == TrainingStatus.COMPLETE
+        skip_live_scoring = bool(training_done and aml and eval_frame)
+
+        if skip_live_scoring:
+            metrics_eval_set = str(result.get("metrics_eval_set") or metrics_eval_set)
+            metrics_eval_rows = int(result.get("metrics_eval_rows") or metrics_eval_rows or 0)
+        elif aml and eval_frame and ml_task_res == "classification":
             try:
                 best_model = h2o_engine.get_best_model(aml)
                 live = h2o_engine.get_model_metrics(
-                    best_model, frame, result.get("ml_task", ""), target_column or None
+                    best_model,
+                    train_frame,
+                    ml_task_res,
+                    target_column or None,
+                    eval_frame=eval_frame,
+                    feature_columns=(run.get("request").feature_columns if run.get("request") else None),
                 )
-                all_metrics.update(live)
-            except Exception:
-                pass
+                validation_metrics.update(live)
+                metrics_eval_set = "holdout" if use_test else "train"
+                metrics_eval_rows = int(eval_frame.nrows)
+                ok, err = h2o_engine.sample_prediction_check(best_model, eval_frame)
+                if not ok:
+                    algo = _extract_algo(best_model.model_id)
+                    evaluation_warnings.append(
+                        f"Sample scoring check failed for {algo} (H2O may log “prediction progress failed”). {err}"
+                    )
+            except Exception as e:
+                evaluation_warnings.append(f"Live validation scoring failed: {str(e)[:200]}")
 
-    if not all_metrics and best:
-        all_metrics = {k: v for k, v in best.metrics.items() if k != "model_id"}
-
-    cleaned_metrics = {}
-    for k, v in all_metrics.items():
-        if v is None:
-            continue
-        try:
-            fv = float(v)
-            if math.isnan(fv) or math.isinf(fv):
+    def _clean_metric_map(m: dict) -> dict:
+        out: dict[str, float] = {}
+        for k, v in (m or {}).items():
+            if v is None:
                 continue
-            cleaned_metrics[k] = round(fv, 6)
-        except (ValueError, TypeError):
-            continue
+            try:
+                fv = float(v)
+                if math.isnan(fv) or math.isinf(fv):
+                    continue
+                prec = 8 if k == "logloss" else 6
+                out[k] = round(fv, prec)
+            except (ValueError, TypeError):
+                continue
+        return out
+
+    cleaned_selection = _clean_metric_map(selection_metrics)
+    cleaned_validation = _clean_metric_map(validation_metrics)
+
+    if ml_task_res == "classification":
+        auc_v = cleaned_selection.get("auc")
+        prec_v = cleaned_validation.get("precision")
+        if auc_v is not None and prec_v is not None and auc_v >= 0.999 and prec_v < 0.95:
+            evaluation_warnings.append(
+                "Leaderboard AUC (cross-validation) is near-perfect while holdout macro-precision is lower: "
+                "ranking can look excellent even when some rows are still misclassified. Review the confusion matrix "
+                "and per-class probabilities on the holdout set."
+            )
 
     feature_importance = result.get("feature_importance", [])
 
     return {
         "run_id": run_id,
         "best_model": best.model_dump() if best else None,
-        "all_metrics": cleaned_metrics,
+        "all_metrics": cleaned_selection,
+        "selection_metrics": cleaned_selection,
+        "validation_metrics": cleaned_validation,
         "feature_importance": feature_importance[:10],
-        "ml_task": result.get("ml_task", ""),
+        "ml_task": ml_task_res,
         "target_column": target_column,
         "feature_columns": feature_columns,
+        "evaluation_warnings": evaluation_warnings,
+        "metrics_eval_set": metrics_eval_set,
+        "metrics_eval_rows": metrics_eval_rows,
+        "n_target_classes": n_cls,
     }
 
 
@@ -1034,32 +1407,55 @@ async def get_confusion_matrix(run_id: str) -> ConfusionMatrixResponse:
     if result.get("ml_task") != "classification":
         raise HTTPException(400, "Confusion matrix only available for classification tasks")
 
-    # Try live H2O (only works if the run is still in memory)
+    if "confusion_matrix" in result:
+        cm = result["confusion_matrix"]
+        labels = cm.get("labels") or []
+        matrix = cm.get("matrix") or []
+        if labels and matrix:
+            return ConfusionMatrixResponse(
+                run_id=run_id,
+                model_id=result.get("best_model_id", "unknown"),
+                labels=labels,
+                matrix=matrix,
+            )
+
+    # Live H2O (same sklearn CM as training-time evaluation)
     if run:
         aml = run.get("aml")
         frame = run.get("frame")
-        if aml and frame:
+        train_frame = run.get("train_frame") or frame
+        test_frame = run.get("test_frame")
+        req = run.get("request")
+        tc = (req.target_column if req else None) or result.get("config", {}).get("target_column", "")
+        if aml and frame and tc:
             best = h2o_engine.get_best_model(aml)
-            cm_data = h2o_engine.get_confusion_matrix(best, frame)
-            if cm_data:
-                return ConfusionMatrixResponse(
-                    run_id=run_id,
-                    model_id=best.model_id,
-                    labels=cm_data["labels"],
-                    matrix=cm_data["matrix"],
+            eval_fr = test_frame if test_frame is not None and int(test_frame.nrows) > 0 else train_frame
+            if eval_fr is not None and int(eval_fr.nrows) > 0:
+                _, cm_data, _ = h2o_engine.evaluate_classification_frame(
+                    best, eval_fr, str(tc), max_detail_rows=0
                 )
-
-    # Try persisted confusion matrix
-    if "confusion_matrix" in result:
-        cm = result["confusion_matrix"]
-        return ConfusionMatrixResponse(
-            run_id=run_id,
-            model_id=result.get("best_model_id", "unknown"),
-            labels=cm.get("labels", []),
-            matrix=cm.get("matrix", []),
-        )
+                if cm_data and cm_data.get("labels"):
+                    return ConfusionMatrixResponse(
+                        run_id=run_id,
+                        model_id=best.model_id,
+                        labels=cm_data["labels"],
+                        matrix=cm_data["matrix"],
+                    )
 
     raise HTTPException(404, "Confusion matrix data not available")
+
+
+def _errors_from_actual_predicted(actual: list, predicted: list) -> list[float]:
+    errors = []
+    n = min(len(actual), len(predicted))
+    for i in range(n):
+        try:
+            a = float(actual[i])
+            p = float(predicted[i])
+            errors.append(round(a - p, 8))
+        except (TypeError, ValueError):
+            errors.append(0.0)
+    return errors
 
 
 async def get_residuals(run_id: str) -> ResidualsResponse:
@@ -1069,34 +1465,159 @@ async def get_residuals(run_id: str) -> ResidualsResponse:
     if result.get("ml_task") != "regression":
         raise HTTPException(400, "Residuals only available for regression tasks")
 
-    # Try live H2O
+    # Try live H2O (holdout when available, else training slice — not full pre-split frame)
     if run:
         aml = run.get("aml")
-        frame = run.get("frame")
-        if aml and frame:
+        train_frame = run.get("train_frame") or run.get("frame")
+        test_frame = run.get("test_frame")
+        eval_frame = test_frame if test_frame is not None and int(test_frame.nrows) > 0 else train_frame
+        if aml and eval_frame:
             best = h2o_engine.get_best_model(aml)
-            preds = best.predict(frame)
+            preds = best.predict(eval_frame)
             pred_col = preds.as_data_frame().iloc[:, 0].tolist()
             req = run["request"]
-            actual_col = frame[req.target_column].as_data_frame().iloc[:, 0].tolist()
+            actual_col = eval_frame[req.target_column].as_data_frame().iloc[:, 0].tolist()
+            n = min(len(pred_col), len(actual_col), 500)
+            act = actual_col[:n]
+            prd = pred_col[:n]
             return ResidualsResponse(
                 run_id=run_id,
                 model_id=best.model_id,
-                actual=actual_col[:500],
-                predicted=pred_col[:500],
+                actual=act,
+                predicted=prd,
+                errors=_errors_from_actual_predicted(act, prd),
             )
 
     # Try persisted residuals
     if "residuals" in result:
         res = result["residuals"]
+        act = res.get("actual", [])
+        prd = res.get("predicted", [])
+        err = res.get("errors")
+        if not err:
+            err = _errors_from_actual_predicted(act, prd)
         return ResidualsResponse(
             run_id=run_id,
             model_id=result.get("best_model_id", "unknown"),
-            actual=res.get("actual", []),
-            predicted=res.get("predicted", []),
+            actual=act,
+            predicted=prd,
+            errors=err,
         )
 
     raise HTTPException(404, "Residual data not available")
+
+
+async def get_holdout_evaluation(run_id: str) -> HoldoutEvaluationResponse:
+    _run, result = _get_result_or_load(run_id)
+    if not result:
+        raise HTTPException(404, "Results not found")
+
+    ho = result.get("holdout_evaluation")
+    if not ho:
+        raise HTTPException(
+            404,
+            "Holdout evaluation not available. Run training again with the latest app to populate test-set predictions.",
+        )
+
+    cls_rows = [ClassificationHoldoutRow(**r) for r in ho.get("classification_rows") or []]
+    reg_rows = [RegressionHoldoutRow(**r) for r in ho.get("regression_rows") or []]
+
+    return HoldoutEvaluationResponse(
+        run_id=run_id,
+        model_id=result.get("best_model_id", "unknown"),
+        train_ratio_config=float(ho.get("train_ratio_config", 0.8)),
+        test_ratio_config=float(ho.get("test_ratio_config", 0.2)),
+        train_rows=int(ho.get("train_rows", 0)),
+        test_rows=int(ho.get("test_rows", 0)),
+        train_fraction_actual=float(ho.get("train_fraction_actual", 0.0)),
+        test_fraction_actual=float(ho.get("test_fraction_actual", 0.0)),
+        classification_rows=cls_rows,
+        regression_rows=reg_rows,
+    )
+
+
+async def export_holdout_predictions_csv(run_id: str):
+    """Full holdout table: features, actual, predicted, class probabilities (CSV)."""
+    run, result = _get_result_or_load(run_id)
+    if not result:
+        raise HTTPException(404, "Results not found")
+    if result.get("ml_task") != "classification":
+        raise HTTPException(400, "Holdout predictions export is only available for classification runs.")
+
+    path = PROCESSED_DATA_DIR / run_id / "holdout_predictions.csv"
+    if path.is_file():
+        return FileResponse(
+            path=str(path),
+            filename=f"holdout_predictions_{run_id}.csv",
+            media_type="text/csv",
+        )
+
+    if run and run.get("aml") and run.get("test_frame") is not None and int(run["test_frame"].nrows) > 0:
+        try:
+            req = run.get("request")
+            tc = (getattr(req, "target_column", None) or result.get("config", {}).get("target_column", "")) or ""
+            feats = list(
+                (getattr(req, "feature_columns", None) or result.get("config", {}).get("feature_columns") or [])
+            )
+            bm = h2o_engine.get_best_model(run["aml"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if tc and h2o_engine.write_classification_holdout_csv(
+                bm, run["test_frame"], str(tc), feats, str(path)
+            ) and path.is_file():
+                return FileResponse(
+                    path=str(path),
+                    filename=f"holdout_predictions_{run_id}.csv",
+                    media_type="text/csv",
+                )
+        except Exception as e:
+            logger.warning("export_holdout_predictions_csv live rebuild failed: %s", e)
+
+    raise HTTPException(
+        404,
+        "Holdout predictions CSV not found. Run training again with the latest app to generate the export file.",
+    )
+
+
+async def export_holdout_regression_predictions_csv(run_id: str):
+    """Full holdout regression table: features, actual, predicted, error (CSV)."""
+    run, result = _get_result_or_load(run_id)
+    if not result:
+        raise HTTPException(404, "Results not found")
+    if result.get("ml_task") != "regression":
+        raise HTTPException(400, "Regression holdout export is only available for regression runs.")
+
+    path = PROCESSED_DATA_DIR / run_id / "holdout_regression_predictions.csv"
+    if path.is_file():
+        return FileResponse(
+            path=str(path),
+            filename=f"holdout_regression_predictions_{run_id}.csv",
+            media_type="text/csv",
+        )
+
+    if run and run.get("aml") and run.get("test_frame") is not None and int(run["test_frame"].nrows) > 0:
+        try:
+            req = run.get("request")
+            tc = (getattr(req, "target_column", None) or result.get("config", {}).get("target_column", "")) or ""
+            feats = list(
+                (getattr(req, "feature_columns", None) or result.get("config", {}).get("feature_columns") or [])
+            )
+            bm = h2o_engine.get_best_model(run["aml"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if tc and h2o_engine.write_regression_holdout_csv(
+                bm, run["test_frame"], str(tc), feats, str(path)
+            ) and path.is_file():
+                return FileResponse(
+                    path=str(path),
+                    filename=f"holdout_regression_predictions_{run_id}.csv",
+                    media_type="text/csv",
+                )
+        except Exception as e:
+            logger.warning("export_holdout_regression_predictions_csv live rebuild failed: %s", e)
+
+    raise HTTPException(
+        404,
+        "Regression holdout CSV not found. Run training again with the latest app to generate the export file.",
+    )
 
 
 async def export_results(run_id: str, format: str = "csv"):
@@ -1199,22 +1720,63 @@ async def get_gains_lift(run_id: str) -> GainsLiftResponse:
         raise HTTPException(404, "Results not found")
 
     if result.get("ml_task") != "classification":
-        return GainsLiftResponse(run_id=run_id, rows=[])
+        return GainsLiftResponse(
+            run_id=run_id,
+            rows=[],
+            note="Gains/lift applies to classification runs only.",
+        )
 
-    # Gains/lift needs live H2O AutoML + frame; absent after restart or storage-only load.
+    persisted_note = (result.get("gains_lift_note") or "").strip()
+    if "gains_lift" in result:
+        raw_rows = result.get("gains_lift") or []
+        rows_out: list[GainsLiftRow] = []
+        for r in raw_rows:
+            if isinstance(r, dict):
+                rows_out.append(GainsLiftRow(**r))
+        return GainsLiftResponse(run_id=run_id, rows=rows_out, note=persisted_note)
+
     if not run:
-        return GainsLiftResponse(run_id=run_id, rows=[])
+        return GainsLiftResponse(
+            run_id=run_id,
+            rows=[],
+            note=persisted_note or "Gains/lift was not stored for this run; re-train with the latest app to capture it.",
+        )
 
     aml = run.get("aml")
-    frame = run.get("frame")
-    if not aml or not frame:
-        return GainsLiftResponse(run_id=run_id, rows=[])
+    train_frame = run.get("train_frame") or run.get("frame")
+    full_frame = run.get("frame")
+    if not aml or not train_frame:
+        return GainsLiftResponse(run_id=run_id, rows=[], note=persisted_note)
 
     best = h2o_engine.get_best_model(aml)
+    if not h2o_engine.model_is_binomial(best):
+        return GainsLiftResponse(
+            run_id=run_id,
+            rows=[],
+            note=(
+                "Gains/lift charts are only available for binary classification in H2O. "
+                "This model is multiclass."
+            ),
+        )
+
     loop = asyncio.get_event_loop()
-    rows_data = await loop.run_in_executor(None, lambda: h2o_engine.get_gains_lift(best, frame))
+    rows_data = await loop.run_in_executor(None, lambda: h2o_engine.get_gains_lift(best, train_frame))
+    note = persisted_note
+    if (
+        not rows_data
+        and full_frame is not None
+        and int(full_frame.nrows) > int(train_frame.nrows)
+    ):
+        rows_data = await loop.run_in_executor(None, lambda: h2o_engine.get_gains_lift(best, full_frame))
+        if rows_data and not note:
+            note = (
+                "Deciles computed on the full imported dataset (before train/holdout split) "
+                "because the post-split training slice was too small for stable deciles."
+            )
     rows = [GainsLiftRow(**r) for r in rows_data]
-    return GainsLiftResponse(run_id=run_id, rows=rows)
+    if not rows and not note:
+        note = "Gains/lift deciles were empty for this dataset size or model."
+    return GainsLiftResponse(run_id=run_id, rows=rows, note=note)
 
 
 async def generate_ai_summary(run_id: str) -> AISummaryResponse:
@@ -1226,6 +1788,7 @@ async def generate_ai_summary(run_id: str) -> AISummaryResponse:
     models = _models_from_persisted(lb) if lb and isinstance(lb[0], dict) else lb
     best = next((m for m in models if m.is_best), None) if models else None
     ml_task = result.get("ml_task", "")
+    n_cls = int(result.get("n_target_classes", 2))
 
     tc = ""
     if run and run.get("request"):
@@ -1233,46 +1796,32 @@ async def generate_ai_summary(run_id: str) -> AISummaryResponse:
     elif result.get("config"):
         tc = result["config"].get("target_column", "")
 
-    all_metrics = {}
-    # Try live H2O
-    if run:
-        aml = run.get("aml")
-        frame = run.get("frame")
-        if aml and frame:
-            try:
-                best_model = h2o_engine.get_best_model(aml)
-                raw_metrics = h2o_engine.get_model_metrics(best_model, frame, ml_task, tc or None)
-                for k, v in raw_metrics.items():
-                    if v is not None:
-                        try:
-                            fv = float(v)
-                            if not (math.isnan(fv) or math.isinf(fv)):
-                                all_metrics[k] = fv
-                        except (ValueError, TypeError):
-                            pass
-            except Exception:
-                pass
+    selection_metrics: dict = dict(result.get("selection_metrics") or {})
+    if not selection_metrics and best:
+        selection_metrics = _h2o_selection_metrics_from_best(best, ml_task, n_cls)
+    if not selection_metrics and best:
+        selection_metrics = {k: v for k, v in best.metrics.items() if k != "model_id" and v is not None}
 
-    if not all_metrics and best:
-        for k, v in best.metrics.items():
-            if k != "model_id" and v is not None:
-                try:
-                    fv = float(v)
-                    if not (math.isnan(fv) or math.isinf(fv)):
-                        all_metrics[k] = fv
-                except (ValueError, TypeError):
-                    pass
+    validation_metrics: dict = dict(result.get("validation_metrics") or {})
+    if not validation_metrics and ml_task == "classification":
+        am = result.get("all_metrics") or {}
+        for k in ("precision", "recall", "f1"):
+            if k in am and am[k] is not None:
+                validation_metrics[k] = am[k]
 
-    # Also try persisted all_metrics
-    if not all_metrics and "all_metrics" in result:
-        all_metrics = result["all_metrics"]
+    metrics_for_ai: dict = {}
+    for k, v in selection_metrics.items():
+        if v is not None:
+            metrics_for_ai[f"model_selection_cv_{k}"] = v
+    for k, v in validation_metrics.items():
+        if v is not None:
+            metrics_for_ai[f"validation_holdout_{k}"] = v
 
     best_algo = best.algorithm if best else "Unknown"
     best_id = best.model_id if best else "Unknown"
     target = tc
 
     num_models = len(lb)
-    metrics_str = ", ".join(f"{k}: {v}" for k, v in (all_metrics or {}).items() if v is not None)
 
     ai = ai_service.get_ai_service()
     try:
@@ -1281,16 +1830,20 @@ async def generate_ai_summary(run_id: str) -> AISummaryResponse:
             best_id=best_id,
             target=target,
             ml_task=ml_task,
-            metrics=all_metrics,
+            metrics=metrics_for_ai,
             num_models=num_models,
         )
         return summary
     except Exception as e:
         logger.warning(f"AI summary generation failed: {e}")
-        return _rule_based_summary(best_algo, best_id, target, ml_task, all_metrics, num_models)
+        return _rule_based_summary(
+            best_algo, best_id, target, ml_task, selection_metrics, validation_metrics, num_models
+        )
 
 
-def _rule_based_summary(best_algo, best_id, target, ml_task, metrics, num_models):
+def _rule_based_summary(
+    best_algo, best_id, target, ml_task, selection_metrics: dict, validation_metrics: dict, num_models: int
+):
 
 
     def _safe(v):
@@ -1302,41 +1855,59 @@ def _rule_based_summary(best_algo, best_id, target, ml_task, metrics, num_models
         except (ValueError, TypeError):
             return None
 
-    auc = _safe(metrics.get("auc"))
-    acc = _safe(metrics.get("accuracy"))
-    rmse = _safe(metrics.get("rmse"))
-    r2 = _safe(metrics.get("r2"))
+    auc = _safe(selection_metrics.get("auc"))
+    logloss = _safe(selection_metrics.get("logloss"))
+    mpce = _safe(selection_metrics.get("mean_per_class_error"))
+    rmse = _safe(selection_metrics.get("rmse"))
+    r2 = _safe(selection_metrics.get("r2"))
+    _dev_raw = selection_metrics.get("mean_residual_deviance")
+    if _dev_raw is None:
+        _dev_raw = selection_metrics.get("deviance")
+    dev = _safe(_dev_raw)
+    f1v = _safe(validation_metrics.get("f1"))
+    prec = _safe(validation_metrics.get("precision"))
+    rec = _safe(validation_metrics.get("recall"))
 
     if ml_task == "classification":
-        perf_desc = f"an AUC of {auc:.4f}" if auc else "the best available metrics"
-        acc_desc = f"and an accuracy of {acc*100:.1f}%" if acc else ""
+        cv_bits = []
+        if auc is not None:
+            cv_bits.append(f"leaderboard AUC (CV) {auc:.4f}")
+        if logloss is not None:
+            cv_bits.append(f"log loss (CV) {logloss:.4f}")
+        if mpce is not None:
+            cv_bits.append(f"mean per-class error (CV) {mpce:.4f}")
+        cv_desc = ", ".join(cv_bits) if cv_bits else "the best available leaderboard metrics"
+        val_bits = []
+        if prec is not None and rec is not None and f1v is not None:
+            val_bits.append(f"holdout macro precision/recall/F1 {prec:.3f} / {rec:.3f} / {f1v:.3f} (sklearn)")
+        val_desc = ("; " + "; ".join(val_bits)) if val_bits else ""
         exec_summary = (
-            f"The H2O AutoML results indicate that the best-performing model for the "
-            f"{ml_task} task of predicting '{target}' is {best_id}, "
-            f"achieving {perf_desc} {acc_desc}."
+            f"The H2O AutoML run for predicting '{target}' selected {best_id} ({best_algo}) among {num_models} models. "
+            f"Model selection (cross-validation): {cv_desc}.{val_desc}"
         )
     else:
-        perf_desc = f"an RMSE of {rmse:.4f}" if rmse else "the best available metrics"
-        r2_desc = f"and R² of {r2:.4f}" if r2 else ""
+        cv_bits = []
+        if dev is not None:
+            cv_bits.append(f"mean residual deviance (CV) {dev:.4f}")
+        if rmse is not None:
+            cv_bits.append(f"RMSE (CV) {rmse:.4f}")
+        cv_desc = ", ".join(cv_bits) if cv_bits else "the best available leaderboard metrics"
         exec_summary = (
-            f"The H2O AutoML results indicate that the best-performing model for the "
-            f"{ml_task} task of predicting '{target}' is {best_id}, "
-            f"achieving {perf_desc} {r2_desc}."
+            f"The H2O AutoML run for predicting '{target}' selected {best_id} ({best_algo}) among {num_models} models. "
+            f"Model selection (cross-validation): {cv_desc}."
         )
 
     insights = [
-        f"The best model, {best_id}, achieved the highest performance among {num_models} trained models.",
+        f"The best model, {best_id}, ranked first on the AutoML leaderboard among {num_models} trained models.",
     ]
     if ml_task == "classification":
-        if acc and acc < 0.75:
-            insights.append(f"The accuracy of {acc*100:.1f}% is reasonable but suggests potential for further optimization.")
-        elif acc and acc >= 0.75:
-            insights.append(f"The accuracy of {acc*100:.1f}% indicates strong predictive performance.")
         if auc and auc < 0.7:
-            insights.append(f"The AUC of {auc:.4f} suggests moderate discriminatory power with room for improvement.")
+            insights.append(f"Leaderboard AUC (CV) of {auc:.4f} suggests moderate separability with room for improvement.")
+        if f1v is not None:
+            insights.append(f"Holdout macro F1 (sklearn) is {f1v:.4f}, consistent with the reported confusion matrix.")
     else:
         if r2 is not None:
-            insights.append(f"The R² score of {r2:.4f} explains {r2*100:.1f}% of variance in the target variable.")
+            insights.append(f"Leaderboard R² (if reported) is {r2:.4f}; review holdout prediction errors in the results view.")
 
     recommendations = [
         f"Focus on improving model performance by addressing potential class imbalance or feature engineering.",
@@ -1669,6 +2240,150 @@ async def get_elbow_analysis(run_id: str) -> ElbowResponse:
     )
 
 
+def _get_clustering_bundle(run_id: str) -> dict | None:
+    """In-memory clustering run or persisted blob (includes result, config, elbow when stored)."""
+    run = _clustering_runs.get(run_id)
+    if run and run.get("result"):
+        req = run.get("request")
+        ds = run.get("dataset")
+        cfg: dict = {}
+        if req is not None:
+            cfg["dataset_id"] = getattr(req, "dataset_id", "")
+            cfg["feature_columns"] = list(getattr(req, "feature_columns", []) or [])
+        if ds is not None:
+            cfg["dataset_filename"] = getattr(ds, "filename", "") or ""
+        out: dict = {"result": run["result"], "config": cfg}
+        if run.get("elbow"):
+            out["elbow"] = run["elbow"]
+        return out
+    persisted = storage_service.get_storage().get_clustering_result(run_id)
+    return persisted
+
+
+ELBOW_INSIGHT_FALLBACK = (
+    "Heuristic K from the elbow chart reflects the best silhouette among KMeans fits for K = 2…10 only. "
+    "The leaderboard picks the best model by a combined score across all algorithms (KMeans, GMM, DBSCAN) "
+    "and hyperparameters (for example K=6 can beat K=5). The elbow chart is only a KMeans-only guide. "
+    "So silhouette can peak at one K here while the global best model uses a different K — that is expected, not a bug."
+)
+
+
+async def get_clustering_elbow_insight(run_id: str) -> TextInsightResponse:
+    bundle = _get_clustering_bundle(run_id)
+    if not bundle or not bundle.get("result"):
+        raise HTTPException(404, "Clustering result not found")
+    r = bundle["result"]
+    e = bundle.get("elbow") or _load_clustering_elbow_from_disk(run_id) or {}
+    recommended_k = int(e.get("recommended_k") or 0)
+    best_metrics = r.get("best_metrics") or {}
+    best_k = int(best_metrics.get("n_clusters") or 0)
+    best_algo = str(r.get("best_algorithm") or "")
+    lb = r.get("leaderboard") or []
+    top = lb[:4] if isinstance(lb, list) else []
+    lb_summary = "; ".join(
+        f"{m.get('algorithm')} K={m.get('n_clusters')} score={m.get('composite_score')}"
+        for m in top if isinstance(m, dict)
+    ) or "n/a"
+
+    if AI_MODE == "azure":
+        try:
+            ai = ai_service.get_ai_service()
+            if hasattr(ai, "clustering_elbow_insight"):
+                text = await ai.clustering_elbow_insight(
+                    best_algo, best_k, recommended_k, lb_summary,
+                )
+                if text:
+                    return TextInsightResponse(text=text, source="azure")
+        except Exception as ex:
+            logger.debug("clustering_elbow_insight Azure fallback: %s", ex)
+
+    return TextInsightResponse(text=ELBOW_INSIGHT_FALLBACK, source="rules")
+
+
+async def get_clustering_labeled_preview(
+    run_id: str,
+    max_rows: int = 10,
+    max_cols: int = 10,
+) -> ClusteringLabeledPreviewResponse:
+    import pandas as pd
+
+    bundle = _get_clustering_bundle(run_id)
+    if not bundle or not bundle.get("result"):
+        raise HTTPException(404, "Clustering result not found")
+    res = bundle["result"]
+    labels = res.get("best_labels")
+    if labels is None:
+        raise HTTPException(404, "Cluster labels not available for this run")
+    cfg = bundle.get("config") or {}
+    dataset_id = cfg.get("dataset_id")
+    filename = cfg.get("dataset_filename")
+    if not dataset_id or not filename:
+        raise HTTPException(400, "Cannot resolve dataset for this clustering run")
+
+    storage = storage_service.get_storage()
+    filepath = storage.get_dataset_path(dataset_id, filename)
+    df = pd.read_csv(filepath)
+    label_list = list(labels)
+    m = min(len(df), len(label_list))
+    if m == 0:
+        raise HTTPException(400, "Dataset or labels are empty")
+    df = df.iloc[:m].reset_index(drop=True)
+    label_list = label_list[:m]
+
+    feat_cols = list(res.get("feature_columns") or [])
+    cols_use = [c for c in feat_cols if c in df.columns][:max_cols]
+    if not cols_use:
+        cols_use = [c for c in df.columns][:max_cols]
+
+    preview = df.loc[:, cols_use].copy()
+    preview["cluster_label"] = label_list
+    preview = preview.head(max_rows)
+    rows = [_sanitize_for_json(row) for row in preview.to_dict(orient="records")]
+    return ClusteringLabeledPreviewResponse(
+        run_id=run_id,
+        columns=list(preview.columns),
+        rows=rows,
+    )
+
+
+async def export_clustering_labeled_csv(run_id: str) -> StreamingResponse:
+    import io
+    import pandas as pd
+
+    bundle = _get_clustering_bundle(run_id)
+    if not bundle or not bundle.get("result"):
+        raise HTTPException(404, "Clustering result not found")
+    res = bundle["result"]
+    labels = res.get("best_labels")
+    if labels is None:
+        raise HTTPException(404, "Cluster labels not available for this run")
+    cfg = bundle.get("config") or {}
+    dataset_id = cfg.get("dataset_id")
+    filename = cfg.get("dataset_filename")
+    if not dataset_id or not filename:
+        raise HTTPException(400, "Cannot resolve dataset for this clustering run")
+
+    storage = storage_service.get_storage()
+    filepath = storage.get_dataset_path(dataset_id, filename)
+    df = pd.read_csv(filepath)
+    label_list = [int(x) for x in list(labels)]
+    m = min(len(df), len(label_list))
+    df = df.iloc[:m].reset_index(drop=True)
+    label_list = label_list[:m]
+    out_df = df.copy()
+    out_df["cluster_label"] = label_list
+
+    buf = io.StringIO()
+    out_df.to_csv(buf, index=False)
+    body = buf.getvalue()
+    safe_name = f"clustering_{run_id}_labeled.csv".replace(" ", "_")
+    return StreamingResponse(
+        iter([body]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+    )
+
+
 async def clustering_websocket(websocket: WebSocket, run_id: str):
     await websocket.accept()
     _clustering_ws.setdefault(run_id, []).append(websocket)
@@ -1694,9 +2409,9 @@ def maybe_prune_training_history_at_startup() -> int:
     return team_db.prune_training_runs_before(TRAINING_HISTORY_PRUNE_BEFORE)
 
 
-async def list_training_history() -> TrainingHistoryResponse:
-    """Return all completed training/clustering runs from the DB."""
-    rows = team_db.list_completed_runs()
+async def list_training_history(limit: Optional[int] = None) -> TrainingHistoryResponse:
+    """Return completed training/clustering runs from the DB (newest first). Pass limit for faster responses."""
+    rows = team_db.list_completed_runs(limit=limit)
     runs = []
     for r in rows:
         runs.append(TrainingRunSummary(

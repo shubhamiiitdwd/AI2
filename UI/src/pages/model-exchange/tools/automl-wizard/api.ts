@@ -7,6 +7,10 @@ import type {
   HFDatasetInfo, AISummaryResponse, AutoDetectTaskResponse,
   ClusteringStartRequest, ClusteringStartResponse,
   ClusteringResultResponse, ElbowResponse,
+  HoldoutEvaluationResponse,
+  DatasetWorkflowInsightResponse,
+  ClusteringLabeledPreviewResponse,
+  TextInsightResponse,
 } from './types';
 
 const DEFAULT_BACKEND_PORT = '8099';
@@ -39,6 +43,11 @@ export const getDatasetPreview = async (id: string, rows = 10): Promise<DatasetP
 
 export const getDatasetColumns = async (id: string): Promise<DatasetColumnsResponse> => {
   const { data } = await api.get(`/team1/datasets/${id}/columns`);
+  return data;
+};
+
+export const getDatasetWorkflowInsight = async (id: string): Promise<DatasetWorkflowInsightResponse> => {
+  const { data } = await api.get(`/team1/datasets/${id}/workflow-insight`);
   return data;
 };
 
@@ -80,8 +89,10 @@ export const stopTraining = async (runId: string): Promise<void> => {
   await api.post(`/team1/training/${runId}/stop`);
 };
 
-export const getTrainingHistory = async (): Promise<TrainingHistoryResponse> => {
-  const { data } = await api.get('/team1/training/history');
+export const getTrainingHistory = async (limit?: number): Promise<TrainingHistoryResponse> => {
+  const { data } = await api.get('/team1/training/history', {
+    params: limit != null ? { limit } : undefined,
+  });
   return data;
 };
 
@@ -115,8 +126,19 @@ export const getResiduals = async (runId: string): Promise<ResidualsResponse> =>
   return data;
 };
 
+export const getHoldoutEvaluation = async (runId: string): Promise<HoldoutEvaluationResponse> => {
+  const { data } = await api.get(`/team1/results/${runId}/holdout-evaluation`);
+  return data;
+};
+
 export const getExportUrl = (runId: string, format: string = 'csv') =>
   `${BASE}/team1/results/${runId}/export?format=${format}`;
+
+export const getHoldoutPredictionsCsvUrl = (runId: string) =>
+  `${BASE}/team1/results/${runId}/holdout-predictions.csv`;
+
+export const getHoldoutRegressionPredictionsCsvUrl = (runId: string) =>
+  `${BASE}/team1/results/${runId}/holdout-regression-predictions.csv`;
 
 export const predict = async (runId: string, featureValues: Record<string, unknown>) => {
   const { data } = await api.post(`/team1/results/${runId}/predict`, { feature_values: featureValues });
@@ -170,6 +192,25 @@ export const getElbowAnalysis = async (runId: string): Promise<ElbowResponse> =>
   const { data } = await api.get(`/team1/clustering/${runId}/elbow`);
   return data;
 };
+
+export const getClusteringElbowInsight = async (runId: string): Promise<TextInsightResponse> => {
+  const { data } = await api.get(`/team1/clustering/${runId}/elbow-insight`);
+  return data;
+};
+
+export const getClusteringLabeledPreview = async (
+  runId: string,
+  rows = 10,
+  cols = 10,
+): Promise<ClusteringLabeledPreviewResponse> => {
+  const { data } = await api.get(`/team1/clustering/${runId}/labeled-preview`, {
+    params: { rows, cols },
+  });
+  return data;
+};
+
+export const getClusteringLabeledCsvUrl = (runId: string) =>
+  `${BASE}/team1/clustering/${runId}/labeled-export.csv`;
 
 export const getWsUrl = (runId: string) => {
   if (BASE) {

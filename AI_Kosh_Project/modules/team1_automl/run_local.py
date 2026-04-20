@@ -13,7 +13,7 @@ if str(project_root) not in sys.path:
 
 from dotenv import load_dotenv
 
-load_dotenv(project_root / ".env")
+load_dotenv(project_root / ".env", override=True)
 
 import uvicorn
 from contextlib import asynccontextmanager
@@ -26,6 +26,15 @@ from modules.team1_automl import services as team1_services
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    import logging
+
+    from modules.team1_automl.config import AZURE_BLOB_CONTAINER_NAME, STORAGE_MODE
+
+    logging.getLogger("uvicorn.error").info(
+        "Team1 AutoML storage: mode=%s container=%s (azure = Blob Storage; local = disk only)",
+        STORAGE_MODE,
+        AZURE_BLOB_CONTAINER_NAME,
+    )
     team1_services.maybe_prune_training_history_at_startup()
     yield
 

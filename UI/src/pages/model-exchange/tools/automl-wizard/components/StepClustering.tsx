@@ -9,6 +9,8 @@ import * as api from '../api';
 import type {
   ClusteringResultResponse, ElbowResponse,
   ColumnInfo,
+  ClusteringLabeledPreviewResponse,
+  TextInsightResponse,
 } from '../types';
 
 const CLUSTER_COLORS = [
@@ -99,6 +101,31 @@ export default function StepClustering({
   const [scatterDomainZoom, setScatterDomainZoom] = useState(1);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const retryCountRef = useRef(0);
+
+  const [labeledPreview, setLabeledPreview] = useState<ClusteringLabeledPreviewResponse | null>(null);
+  const [elbowInsight, setElbowInsight] = useState<TextInsightResponse | null>(null);
+  const [elbowInsightLoading, setElbowInsightLoading] = useState(false);
+
+  const effectiveRunId = clusteringResultProp?.run_id ?? fetchedResult?.run_id ?? null;
+
+  useEffect(() => {
+    if (wizardView !== 'results' || !effectiveRunId) {
+      setLabeledPreview(null);
+      return;
+    }
+    void api.getClusteringLabeledPreview(effectiveRunId, 10, 10)
+      .then(setLabeledPreview)
+      .catch(() => setLabeledPreview(null));
+  }, [wizardView, effectiveRunId]);
+
+  useEffect(() => {
+    if (activeTab !== 'elbow' || !effectiveRunId) return;
+    setElbowInsightLoading(true);
+    void api.getClusteringElbowInsight(effectiveRunId)
+      .then(setElbowInsight)
+      .catch(() => setElbowInsight(null))
+      .finally(() => setElbowInsightLoading(false));
+  }, [activeTab, effectiveRunId]);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const progressRef = useRef(0);
@@ -415,7 +442,7 @@ export default function StepClustering({
         </div>
 
         <button className="aw-back-btn" style={{ marginBottom: 12 }} type="button" onClick={onBackToLogs}>
-          ← Back to model search &amp; logs
+          ← Back to model search & logs
         </button>
 
         {/* Tabs */}
@@ -438,6 +465,46 @@ export default function StepClustering({
         {/* Overview tab */}
         {activeTab === 'overview' && (
           <div className="cl-overview">
+            <div className="cl-labeled-section">
+              <h4>Labeled dataset (best model)</h4>
+              <p className="cl-elbow-hint">
+                Preview shows up to 10 rows and 10 feature columns plus <code>cluster_label</code> (0…K−1; DBSCAN may use -1 for noise).
+              </p>
+              <div className="cl-labeled-actions">
+                <a
+                  href={api.getClusteringLabeledCsvUrl(result.run_id)}
+                  className="aw-btn aw-btn--secondary"
+                  download
+                >
+                  Download full CSV with cluster_label
+                </a>
+              </div>
+              {labeledPreview?.rows?.length ? (
+                <div className="cl-labeled-table-wrap">
+                  <table className="cl-labeled-table">
+                    <thead>
+                      <tr>
+                        {labeledPreview.columns.map((c) => (
+                          <th key={c}>{c}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {labeledPreview.rows.map((row, i) => (
+                        <tr key={i}>
+                          {labeledPreview.columns.map((c) => (
+                            <td key={c}>{row[c] != null && row[c] !== '' ? String(row[c]) : '—'}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="cl-no-data">Preview not available for this run.</p>
+              )}
+            </div>
+
             <div className="cl-overview-grid">
               <div className="cl-overview-card">
                 <div className="cl-chart-zoom-header">
@@ -651,6 +718,13 @@ export default function StepClustering({
               The <strong>leaderboard</strong> picks the best model by a combined score across <em>all</em> algorithms (KMeans, GMM, DBSCAN) and hyperparameters (e.g. K=6 can beat K=5).
               The elbow chart is only a <em>KMeans-only</em> guide. So silhouette can peak at K=5 here while the global best model uses K=6 — that is expected, not a bug.
             </p>
+            {elbowInsightLoading && <p className="cl-elbow-ai-loading">Loading AI insight…</p>}
+            {elbowInsight?.text && (
+              <div className="cl-elbow-ai-box">
+                <strong>{elbowInsight.source === 'azure' ? 'Azure OpenAI insight' : 'Guidance'}</strong>
+                <p style={{ margin: 0 }}>{elbowInsight.text}</p>
+              </div>
+            )}
             <div className="cl-elbow-charts">
               <div className="cl-elbow-chart">
                 <h5>Inertia vs K</h5>

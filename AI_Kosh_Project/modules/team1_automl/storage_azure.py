@@ -1,6 +1,7 @@
 """
 Azure Blob Storage implementation.
-Activated when AZURE_STORAGE_CONNECTION_STRING is set in .env.
+Activated when AZURE_STORAGE_CONNECTION_STRING is set, or when
+AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY are set (connection string is built the same way as the Azure portal / CLI).
 
 Layout (single container, e.g. AZURE_BLOB_CONTAINER_NAME=aikosh-v2):
   {AUTOML_PREFIX}/datasets/{dataset_id}/{filename}
@@ -44,11 +45,14 @@ def _get_blob_service():
     global _blob_service
     if _blob_service is None:
         try:
+            from azure.core.exceptions import ResourceExistsError
             from azure.storage.blob import BlobServiceClient
+
             _blob_service = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+            container = _blob_service.get_container_client(AZURE_BLOB_CONTAINER_NAME)
             try:
-                _blob_service.create_container(AZURE_BLOB_CONTAINER_NAME)
-            except Exception:
+                container.create_container()
+            except ResourceExistsError:
                 pass
             logger.info(
                 "Azure Blob Storage initialized: container=%s prefix=%s/",

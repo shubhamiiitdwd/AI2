@@ -63,6 +63,14 @@ def _migrate_db():
                 except Exception:
                     pass
 
+        try:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_training_runs_status_created "
+                "ON training_runs(status, created_at DESC)"
+            )
+        except Exception:
+            pass
+
 
 init_db()
 _migrate_db()
@@ -175,18 +183,24 @@ def update_run_results(
         )
 
 
-def list_completed_runs() -> list[dict]:
-    """Get all completed training/clustering runs with metadata."""
+def list_completed_runs(limit: int | None = None) -> list[dict]:
+    """Get completed training/clustering runs with metadata (newest first). Optional limit for faster reads."""
+    lim = int(limit) if limit is not None else None
+    if lim is not None and lim < 1:
+        lim = 1
+    sql = (
+        """SELECT run_id, dataset_id, status, ml_task, target_column,
+                  best_model_id, best_algorithm, primary_metric,
+                  best_metric_value, model_count, dataset_filename,
+                  run_type, created_at, updated_at
+           FROM training_runs
+           WHERE status = 'complete'
+           ORDER BY datetime(created_at) DESC"""
+    )
+    if lim is not None:
+        sql += f" LIMIT {lim}"
     with _get_conn() as conn:
-        rows = conn.execute(
-            """SELECT run_id, dataset_id, status, ml_task, target_column,
-                      best_model_id, best_algorithm, primary_metric,
-                      best_metric_value, model_count, dataset_filename,
-                      run_type, created_at, updated_at
-               FROM training_runs
-               WHERE status = 'complete'
-               ORDER BY created_at DESC"""
-        ).fetchall()
+        rows = conn.execute(sql).fetchall()
     return [dict(r) for r in rows]
 
 

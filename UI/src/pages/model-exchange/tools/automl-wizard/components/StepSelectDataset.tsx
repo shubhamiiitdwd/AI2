@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
-import type { DatasetMetadata } from '../types';
+import type { DatasetMetadata, DatasetWorkflowInsightResponse } from '../types';
 import * as api from '../api';
+import { aiSourceDisplay } from '../aiSource';
 
 type TaskChoice = 'auto' | 'classification' | 'regression' | 'clustering';
 
@@ -18,10 +19,34 @@ export default function StepSelectDataset({ dataset, onSelect, onClusteringSelec
   const [dragOver, setDragOver] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const [taskChoice, setTaskChoice] = useState<TaskChoice>('auto');
+  const [workflowInsight, setWorkflowInsight] = useState<DatasetWorkflowInsightResponse | null>(null);
+  const [insightLoading, setInsightLoading] = useState(false);
 
   useEffect(() => {
     api.listDatasets().then(setDatasets).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!dataset?.id) {
+      setWorkflowInsight(null);
+      return;
+    }
+    let cancelled = false;
+    setInsightLoading(true);
+    api.getDatasetWorkflowInsight(dataset.id)
+      .then((ins) => {
+        if (!cancelled) setWorkflowInsight(ins);
+      })
+      .catch(() => {
+        if (!cancelled) setWorkflowInsight(null);
+      })
+      .finally(() => {
+        if (!cancelled) setInsightLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [dataset?.id]);
 
   const handleUpload = async (file: File) => {
     setUploading(true);
@@ -89,6 +114,39 @@ export default function StepSelectDataset({ dataset, onSelect, onClusteringSelec
                 <span className="aw-badge">{dataset.category}</span>
               </div>
             </div>
+
+            {(insightLoading || workflowInsight) && (
+              <div className="aw-dataset-insight">
+                {insightLoading && <p className="aw-dataset-insight-loading">Analyzing dataset shape…</p>}
+                {!insightLoading && workflowInsight && (
+                  <>
+                    <div className="aw-dataset-insight-header">
+                      <span className="aw-dataset-insight-title">{workflowInsight.headline}</span>
+                      {workflowInsight.source && (
+                        <span className={`aw-badge ${aiSourceDisplay(workflowInsight.source).badgeClass}`}>
+                          {aiSourceDisplay(workflowInsight.source).label}
+                        </span>
+                      )}
+                    </div>
+                    <p className="aw-dataset-insight-detail">{workflowInsight.detail}</p>
+                    {workflowInsight.needs_data_exchange && (
+                      <div className="aw-dataset-insight-actions">
+                        <button
+                          type="button"
+                          className="aw-btn aw-btn--secondary"
+                          title="Connect to Data Exchange (coming soon)"
+                          onClick={() => {
+                            /* placeholder until Data Exchange route is wired */
+                          }}
+                        >
+                          Data Exchange
+                        </button>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
 
             <div className="aw-task-picker">
               <label className="aw-task-picker-label">I know the ML task for this dataset:</label>
