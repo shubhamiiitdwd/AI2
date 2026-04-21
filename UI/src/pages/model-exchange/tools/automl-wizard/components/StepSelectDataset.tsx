@@ -2,18 +2,28 @@ import { useState, useRef, useEffect } from 'react';
 import type { DatasetMetadata, DatasetWorkflowInsightResponse } from '../types';
 import * as api from '../api';
 import { aiSourceDisplay } from '../aiSource';
+import CatalogView from '../catalog/CatalogView';
 
 type TaskChoice = 'auto' | 'classification' | 'regression' | 'clustering';
 
 interface Props {
   dataset: DatasetMetadata | null;
   onSelect: (ds: DatasetMetadata) => void;
+  /** When set, catalog import runs this (e.g. advance wizard) instead of only `onSelect`. */
+  onCatalogImportComplete?: (ds: DatasetMetadata) => void | Promise<void>;
   onClusteringSelect?: (ds: DatasetMetadata) => void;
   onContinue?: (taskChoice?: TaskChoice) => void | Promise<void>;
   onClearDataset?: () => void;
 }
 
-export default function StepSelectDataset({ dataset, onSelect, onClusteringSelect, onContinue, onClearDataset }: Props) {
+export default function StepSelectDataset({
+  dataset,
+  onSelect,
+  onCatalogImportComplete,
+  onClusteringSelect,
+  onContinue,
+  onClearDataset,
+}: Props) {
   const [datasets, setDatasets] = useState<DatasetMetadata[]>([]);
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
@@ -21,6 +31,7 @@ export default function StepSelectDataset({ dataset, onSelect, onClusteringSelec
   const [taskChoice, setTaskChoice] = useState<TaskChoice>('auto');
   const [workflowInsight, setWorkflowInsight] = useState<DatasetWorkflowInsightResponse | null>(null);
   const [insightLoading, setInsightLoading] = useState(false);
+  const [catalogOpen, setCatalogOpen] = useState(false);
 
   useEffect(() => {
     api.listDatasets().then(setDatasets).catch(() => {});
@@ -115,9 +126,22 @@ export default function StepSelectDataset({ dataset, onSelect, onClusteringSelec
               </div>
             </div>
 
+            <div className="aw-dataset-nav-actions">
+              <button
+                type="button"
+                className="aw-btn aw-btn--secondary aw-dataset-nav-actions__btn"
+                title="Navigation to Data Exchange will be wired later"
+                onClick={() => {}}
+              >
+                Data Exchange
+              </button>
+            </div>
+
             {(insightLoading || workflowInsight) && (
               <div className="aw-dataset-insight">
-                {insightLoading && <p className="aw-dataset-insight-loading">Analyzing dataset shape…</p>}
+                {insightLoading && (
+                  <p className="aw-dataset-insight-loading">Analyzing dataset with AI (Azure when configured)…</p>
+                )}
                 {!insightLoading && workflowInsight && (
                   <>
                     <div className="aw-dataset-insight-header">
@@ -129,19 +153,29 @@ export default function StepSelectDataset({ dataset, onSelect, onClusteringSelec
                       )}
                     </div>
                     <p className="aw-dataset-insight-detail">{workflowInsight.detail}</p>
-                    {workflowInsight.needs_data_exchange && (
-                      <div className="aw-dataset-insight-actions">
-                        <button
-                          type="button"
-                          className="aw-btn aw-btn--secondary"
-                          title="Connect to Data Exchange (coming soon)"
-                          onClick={() => {
-                            /* placeholder until Data Exchange route is wired */
-                          }}
-                        >
-                          Data Exchange
-                        </button>
+                    {(workflowInsight.data_characteristics || '').trim() !== '' && (
+                      <div className="aw-insight-block">
+                        <h5 className="aw-insight-block-title">What kind of data is this?</h5>
+                        <p className="aw-insight-block-body">{workflowInsight.data_characteristics}</p>
                       </div>
+                    )}
+                    {(workflowInsight.preprocessing_guidance || '').trim() !== '' && (
+                      <div className="aw-insight-block">
+                        <h5 className="aw-insight-block-title">Preprocessing and data quality</h5>
+                        <p className="aw-insight-block-body">{workflowInsight.preprocessing_guidance}</p>
+                      </div>
+                    )}
+                    {(workflowInsight.feature_engineering_guidance || '').trim() !== '' && (
+                      <div className="aw-insight-block">
+                        <h5 className="aw-insight-block-title">Feature engineering</h5>
+                        <p className="aw-insight-block-body">{workflowInsight.feature_engineering_guidance}</p>
+                      </div>
+                    )}
+                    {workflowInsight.needs_data_exchange && (
+                      <p className="aw-insight-exchange-hint">
+                        This dataset likely needs work in <strong>Data Exchange</strong> before reliable AutoML.
+                        Use the Data Exchange button above when navigation is available.
+                      </p>
                     )}
                   </>
                 )}
@@ -205,6 +239,60 @@ export default function StepSelectDataset({ dataset, onSelect, onClusteringSelec
                 }}
               />
             </div>
+
+            <div className="aw-upload-alt">
+              <span className="aw-upload-alt-label">or</span>
+              <button
+                type="button"
+                className="aw-btn aw-btn--secondary aw-btn--full"
+                onClick={() => setCatalogOpen(true)}
+              >
+                Browse data.gov.in catalog (India)
+              </button>
+              <p className="aw-upload-alt-hint">
+                Search government datasets, preview rows, then import for training. Requires{' '}
+                <code>DATA_GOV_API_KEY</code> in the API <code>.env</code>.
+              </p>
+            </div>
+
+            {catalogOpen && (
+              <div
+                className="aw-catalog-modal-backdrop"
+                role="presentation"
+                onClick={() => setCatalogOpen(false)}
+              >
+                <div
+                  className="aw-catalog-modal"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-label="Government dataset catalog"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <button
+                    type="button"
+                    className="aw-catalog-modal-close"
+                    aria-label="Close catalog"
+                    onClick={() => setCatalogOpen(false)}
+                  >
+                    ✕
+                  </button>
+                  <CatalogView
+                    onDatasetImported={async (meta) => {
+                      setDatasets((prev) => {
+                        const filtered = prev.filter((d) => d.filename !== meta.filename);
+                        return [...filtered, meta];
+                      });
+                      setCatalogOpen(false);
+                      if (onCatalogImportComplete) {
+                        await onCatalogImportComplete(meta);
+                      } else {
+                        await onSelect(meta);
+                      }
+                    }}
+                  />
+                </div>
+              </div>
+            )}
 
             {datasets.length > 0 && (
               <div className="aw-dataset-catalog">

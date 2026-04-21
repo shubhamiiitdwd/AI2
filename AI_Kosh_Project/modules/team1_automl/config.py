@@ -90,5 +90,12 @@ H2O_MAX_RUNTIME_SECS = int(os.getenv("H2O_MAX_RUNTIME_SECS", "300"))
 H2O_NFOLDS = int(os.getenv("H2O_NFOLDS", "5"))
 H2O_SEED = int(os.getenv("H2O_SEED", "42"))
 
-for d in [RAW_UPLOADS_DIR, PROCESSED_DATA_DIR, MODELS_DIR]:
+DATA_GOV_STAGING_DIR = SHARED_WORKSPACE / "data_gov_staging"
+DATA_GOV_API_KEY = (os.getenv("DATA_GOV_API_KEY") or "").strip()
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
+GROQ_MODEL = (os.getenv("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()
+NVIDIA_API_KEY = (os.getenv("NVIDIA_API_KEY") or "").strip()
+NVIDIA_MODEL = (os.getenv("NVIDIA_MODEL") or "meta/llama-3.3-70b-instruct").strip()
+
+for d in [RAW_UPLOADS_DIR, PROCESSED_DATA_DIR, MODELS_DIR, DATA_GOV_STAGING_DIR]:
     d.mkdir(parents=True, exist_ok=True)

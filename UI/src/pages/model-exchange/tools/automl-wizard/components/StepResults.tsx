@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import {
-  BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
 } from 'recharts';
 import type {
   LeaderboardResponse,
@@ -15,13 +15,6 @@ import { aiSourceDisplay } from '../aiSource';
 interface Props {
   runId: string;
   onBack?: () => void;
-}
-
-interface GainsLiftRow {
-  group: number;
-  cumulative_data_pct: number;
-  lift: number;
-  gain_pct: number;
 }
 
 interface PredictionResult {
@@ -43,6 +36,32 @@ function formatMetricValue(k: string, v: number | null): string {
   return x.toFixed(4);
 }
 
+function hintFromColumnName(name: string, dtype: string): string {
+  const n = name.toLowerCase().replace(/[_-]+/g, ' ');
+  const d = (dtype || '').toLowerCase();
+  if (/(^|\s)(gender|sex)(\s|$)/.test(n)) {
+    return 'Use the same labels as training, e.g. Male, Female, M, F';
+  }
+  if (/email/.test(n)) return 'Text exactly as stored in the dataset';
+  if (/phone|mobile|contact/.test(n)) return 'Digits or text in the same format as training';
+  if (/country|nation|city|state|region|zip|postal/.test(n)) {
+    return 'Same spelling and casing as in your training rows';
+  }
+  if (/date|dob|birth|timestamp/.test(n)) return 'Date or number format consistent with the dataset';
+  if (/\bage\b/.test(n)) return 'Numeric age, e.g. 34';
+  if (/year/.test(n)) return 'Year or numeric code, e.g. 2020';
+  if (/income|salary|price|amount|balance|score|rating|quantity/.test(n)) {
+    return 'Numeric value in the same units as training';
+  }
+  if (/yes|no|flag|active|enabled|is_/.test(n)) {
+    return 'Often 0/1, Yes/No, or True/False — match training values';
+  }
+  if (d.includes('int') || d.includes('float') || d === 'real' || d.includes('numeric')) {
+    return 'Numeric value, e.g. 1.25';
+  }
+  return 'Enter the same kind of value as in your training file';
+}
+
 export default function StepResults({ runId, onBack }: Props) {
   const [leaderboard, setLeaderboard] = useState<LeaderboardResponse | null>(null);
   const [bestModelData, setBestModelData] = useState<Record<string, unknown> | null>(null);
@@ -53,8 +72,6 @@ export default function StepResults({ runId, onBack }: Props) {
 
   const [aiSummary, setAiSummary] = useState<AISummaryResponse | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
-  const [gainsLift, setGainsLift] = useState<GainsLiftRow[]>([]);
-  const [gainsLiftNote, setGainsLiftNote] = useState('');
   const [confusionMatrix, setConfusionMatrix] = useState<ConfusionMatrixResponse | null>(null);
   const [holdoutEval, setHoldoutEval] = useState<HoldoutEvaluationResponse | null>(null);
   const [residualsFallback, setResidualsFallback] = useState<ResidualsResponse | null>(null);
@@ -65,6 +82,7 @@ export default function StepResults({ runId, onBack }: Props) {
   const [showPasteCSV, setShowPasteCSV] = useState(false);
   const [csvText, setCsvText] = useState('');
   const [predictSampleError, setPredictSampleError] = useState('');
+  const [predictHints, setPredictHints] = useState<Record<string, string>>({});
 
   const loadResults = useCallback(async (isInitial: boolean) => {
     try {
@@ -91,19 +109,6 @@ export default function StepResults({ runId, onBack }: Props) {
         setFeatureValues(initial);
       }
 
-      if ((lb?.ml_task || '').toLowerCase() === 'classification') {
-        void api.getGainsLift(runId).then((gl: { rows?: GainsLiftRow[]; note?: string }) => {
-          setGainsLift(gl.rows || []);
-          setGainsLiftNote((gl.note || '').trim());
-        }).catch(() => {
-          setGainsLift([]);
-          setGainsLiftNote('');
-        });
-      } else {
-        setGainsLift([]);
-        setGainsLiftNote('');
-      }
-
       if (lb) {
         const task = (lb.ml_task || '').toLowerCase();
         if (task === 'classification') {
@@ -124,6 +129,34 @@ export default function StepResults({ runId, onBack }: Props) {
     setLoading(true);
     void loadResults(true);
   }, [loadResults]);
+
+  useEffect(() => {
+    const bm = bestModelData as Record<string, unknown> | null;
+    const id = (bm?.dataset_id as string | undefined)?.trim();
+    const feats = bm?.feature_columns as string[] | undefined;
+    if (!id || !feats?.length) {
+      setPredictHints({});
+      return;
+    }
+    let cancelled = false;
+    void api.getDatasetColumns(id).then((res) => {
+      if (cancelled) return;
+      const next: Record<string, string> = {};
+      for (const f of feats) {
+        const col = res.columns.find((c) => c.name === f);
+        const samples = (col?.sample_values || []).filter(Boolean).slice(0, 4);
+        const short = samples.map((s) => (s.length > 36 ? `${s.slice(0, 33)}…` : s));
+        const dtype = col?.dtype || '';
+        next[f] = short.length
+          ? `Examples from your data: ${short.slice(0, 3).join(', ')}`
+          : hintFromColumnName(f, dtype);
+      }
+      setPredictHints(next);
+    }).catch(() => {
+      if (!cancelled) setPredictHints({});
+    });
+    return () => { cancelled = true; };
+  }, [bestModelData]);
 
   // Refresh leaderboard / best model when the backend updates (re-run, new metrics).
   useEffect(() => {
@@ -205,7 +238,6 @@ export default function StepResults({ runId, onBack }: Props) {
   const mlTask = (mlTaskRaw || '').toLowerCase();
   const targetCol = (bestModelData as Record<string, unknown>)?.target_column as string || '';
   const evaluationWarnings = ((bestModelData as Record<string, unknown>)?.evaluation_warnings as string[] | undefined)?.filter(Boolean) || [];
-  const nTargetClasses = Number((bestModelData as Record<string, unknown>)?.n_target_classes ?? 2);
 
   const bestAlgo = (bestModel?.algorithm as string)
     || (leaderboard.models.find(m => m.is_best)?.algorithm)
@@ -216,7 +248,7 @@ export default function StepResults({ runId, onBack }: Props) {
     ? Object.keys(leaderboard.models[0].metrics).filter(k => leaderboard.models[0].metrics[k] != null)
     : [];
 
-  const HIGHER_IS_BETTER = new Set(['auc', 'accuracy', 'r2', 'f1', 'precision', 'recall']);
+  const HIGHER_IS_BETTER = new Set(['auc', 'accuracy', 'r2', 'f1', 'precision', 'recall', 'gini']);
 
   const sortedModels = [...leaderboard.models].sort((a, b) => {
     const av = Number(a.metrics[sortMetric] ?? (HIGHER_IS_BETTER.has(sortMetric) ? -Infinity : Infinity));
@@ -225,15 +257,24 @@ export default function StepResults({ runId, onBack }: Props) {
   });
 
   const primaryMetric = leaderboard.primary_metric || metricKeys[0] || 'mean_per_class_error';
-  const bestMetrics = bestModel?.metrics as Record<string, number> | undefined;
+  const bestMetrics = bestModel?.metrics as Record<string, number | null> | undefined;
 
-  const selectionMetricOrder = mlTask === 'classification'
-    ? (nTargetClasses <= 2 ? (['auc', 'logloss'] as const) : (['mean_per_class_error', 'logloss', 'auc'] as const))
-    : (['mean_residual_deviance', 'rmse', 'mae'] as const);
-
-  const modelSelectionEntries = selectionMetricOrder.map((k) => {
-    const raw = selectionMetrics[k] ?? (k === 'mean_residual_deviance' ? selectionMetrics.deviance : undefined);
-    return { key: k, value: raw != null && !Number.isNaN(Number(raw)) ? Number(raw) : null };
+  const bestLbRow = leaderboard.models.find((m) => m.is_best) ?? leaderboard.models[0];
+  const lbRowMetrics = (bestLbRow?.metrics ?? {}) as Record<string, number | null | undefined>;
+  const apiBestMetrics = (bestMetrics ?? {}) as Record<string, number | null | undefined>;
+  const mergedCvMetrics: Record<string, number | null | undefined> = { ...lbRowMetrics, ...apiBestMetrics };
+  const cvMetricKeys = Object.keys(mergedCvMetrics).filter(
+    (k) => k !== 'model_id' && mergedCvMetrics[k] != null && mergedCvMetrics[k] !== '',
+  );
+  const pmKey = (leaderboard.primary_metric || primaryMetric || '').trim();
+  const orderedCvKeys = [
+    ...(pmKey && cvMetricKeys.includes(pmKey) ? [pmKey] : []),
+    ...cvMetricKeys.filter((k) => k !== pmKey).sort((a, b) => a.localeCompare(b)),
+  ];
+  const leaderboardCvMetricEntries = orderedCvKeys.map((k) => {
+    const raw = mergedCvMetrics[k];
+    const n = Number(raw);
+    return { key: k, value: Number.isFinite(n) ? n : null };
   });
 
   const bestPrimaryValue = (selectionMetrics[primaryMetric] ?? (primaryMetric === 'mean_residual_deviance' ? selectionMetrics.deviance : undefined))
@@ -259,8 +300,11 @@ export default function StepResults({ runId, onBack }: Props) {
   const METRIC_LABELS: Record<string, string> = {
     auc: 'AUC', accuracy: 'ACCURACY', logloss: 'LOG LOSS', rmse: 'RMSE',
     mse: 'MSE', mae: 'MAE', r2: 'R²', f1: 'F1', precision: 'PRECISION',
-    recall: 'RECALL', mean_per_class_error: 'MEAN PER CLASS ERROR', rmsle: 'RMSLE',
+    recall: 'RECALL',     mean_per_class_error: 'MEAN PER CLASS ERROR', rmsle: 'RMSLE',
     mean_residual_deviance: 'DEVIANCE', deviance: 'DEVIANCE',
+    gini: 'GINI', mae_per_class: 'MAE / CLASS', rmsle_per_class: 'RMSLE / CLASS',
+    logloss_per_class: 'LOG LOSS / CLASS', training_time_ms: 'TRAIN TIME (MS)',
+    prediction_time_per_row_ms: 'PREDICT / ROW (MS)', training_scoring_time: 'TRAIN SCORE TIME',
   };
 
   const metricsEvalSet = (bestModelData as Record<string, unknown>)?.metrics_eval_set as string | undefined;
@@ -322,44 +366,50 @@ export default function StepResults({ runId, onBack }: Props) {
           </div>
         )}
 
-        {/* 1 — Model selection (H2O leaderboard / CV only) */}
-        <div className="aw-perf-section">
-          <h3 className="aw-perf-title">Model Selection Metrics (H2O AutoML - Cross Validation)</h3>
-          <p className="aw-lb-subtitle aw-metrics-scope">{selectionMetricsNote}</p>
-          <div className="aw-perf-cards">
-            {modelSelectionEntries.map(({ key: k, value: v }) => (
-              <div key={k} className="aw-perf-card">
-                <span className="aw-perf-card-label">{METRIC_LABELS[k] || k.toUpperCase()}</span>
-                <span className="aw-perf-card-value">
-                  {formatMetricValue(k, v)}
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* 2a — Classification validation (sklearn holdout only) */}
-        {mlTask === 'classification' && (
-          <div className="aw-perf-section">
-            <h3 className="aw-perf-title">Validation Metrics (sklearn - Holdout Data)</h3>
-            {validationMetricsNote && (
-              <p className="aw-lb-subtitle aw-metrics-scope">{validationMetricsNote}</p>
-            )}
-            <p className="aw-lb-subtitle">
-              Macro precision, recall, and F1 from scikit-learn only. These are not leaderboard (CV) metrics and do not include AUC, log loss, or RMSE.
-            </p>
-            <div className="aw-perf-cards">
-              {(['precision', 'recall', 'f1'] as const).map((k) => (
-                <div key={k} className="aw-perf-card">
-                  <span className="aw-perf-card-label">{METRIC_LABELS[k]}</span>
-                  <span className="aw-perf-card-value">
-                    {formatMetricValue(k, validationMetrics[k] ?? null)}
-                  </span>
-                </div>
-              ))}
+        <div className={`aw-results-metrics-hero${mlTask === 'classification' ? ' aw-results-metrics-hero--two-col' : ''}`}>
+          {/* 1 — All leaderboard (CV) metrics for the best model */}
+          <div className={`aw-perf-section aw-perf-section--cv aw-perf-section--task-${mlTask}`}>
+            <h3 className="aw-perf-title">Model selection metrics (H2O AutoML leaderboard)</h3>
+            <p className="aw-lb-subtitle aw-metrics-scope aw-metrics-scope--tight">{selectionMetricsNote}</p>
+            <div className="aw-perf-cards aw-perf-cards--dense">
+              {leaderboardCvMetricEntries.length === 0 ? (
+                <p className="aw-lb-subtitle aw-metrics-empty">Leaderboard metrics will appear when training completes.</p>
+              ) : (
+                leaderboardCvMetricEntries.map(({ key: k, value: v }) => (
+                  <div key={k} className="aw-perf-card aw-perf-card--compact">
+                    <span className="aw-perf-card-label">{METRIC_LABELS[k] || k.replace(/_/g, ' ').toUpperCase()}</span>
+                    <span className="aw-perf-card-value">
+                      {formatMetricValue(k, v)}
+                    </span>
+                  </div>
+                ))
+              )}
             </div>
           </div>
-        )}
+
+          {/* 2a — Classification validation (sklearn holdout only) */}
+          {mlTask === 'classification' && (
+            <div className="aw-perf-section aw-perf-section--validation-cls">
+              <h3 className="aw-perf-title">Holdout validation (scikit-learn)</h3>
+              {validationMetricsNote && (
+                <p className="aw-lb-subtitle aw-metrics-scope aw-metrics-scope--tight">{validationMetricsNote}</p>
+              )}
+              <p className="aw-lb-subtitle aw-lb-subtitle--inline">
+                Macro precision, recall, and F1 on holdout rows — not the same as CV leaderboard scores.
+              </p>
+              <div className="aw-perf-cards aw-perf-cards--dense aw-perf-cards--cls-validation">
+                {(['precision', 'recall', 'f1'] as const).map((k) => (
+                  <div key={k} className="aw-perf-card aw-perf-card--compact aw-perf-card--cls">
+                    <span className="aw-perf-card-label">{METRIC_LABELS[k]}</span>
+                    <span className="aw-perf-card-value">
+                      {formatMetricValue(k, validationMetrics[k] ?? null)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
 
         {/* 2b — Regression validation (holdout actual / predicted / error) */}
         {mlTask === 'regression' && regressionHoldoutPreview.length > 0 && (
@@ -595,55 +645,6 @@ export default function StepResults({ runId, onBack }: Props) {
           </div>
         )}
 
-        {/* Gains/Lift — after confusion matrix; binary classification */}
-        {mlTask === 'classification' && (gainsLift.length > 0 || Boolean(gainsLiftNote)) && (
-          <div className="aw-gains-section">
-            <h3 className="aw-perf-title">Gains / Lift</h3>
-            {gainsLift.length > 0 && (
-              <>
-                <div className="aw-chart-container aw-gains-chart">
-                  <ResponsiveContainer width="100%" height={280}>
-                    <LineChart data={gainsLift}>
-                      <CartesianGrid strokeDasharray="3 3" />
-                      <XAxis dataKey="group" name="Group" />
-                      <YAxis />
-                      <Tooltip />
-                      <Legend />
-                      <Line type="monotone" dataKey="lift" name="Lift" stroke="#e67e22" strokeWidth={2} dot />
-                      <Line type="monotone" dataKey="cumulative_data_pct" name="Cumulative data %" stroke="#3498db" strokeWidth={2} dot />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </div>
-                <p className="aw-lb-subtitle">
-                  {gainsLiftNote.includes('full imported')
-                    ? 'Decile lift vs cumulative coverage (see note below for which frame was scored).'
-                    : 'Decile lift vs cumulative data coverage (training frame after split).'}
-                </p>
-                <div className="aw-table-scroll">
-                  <table className="aw-lb-table">
-                    <thead>
-                      <tr><th>Group</th><th>Cumulative Data %</th><th>Lift</th><th>Gain %</th></tr>
-                    </thead>
-                    <tbody>
-                      {gainsLift.map(row => (
-                        <tr key={row.group}>
-                          <td>{row.group}</td>
-                          <td>{row.cumulative_data_pct}%</td>
-                          <td><strong>{row.lift}x</strong></td>
-                          <td>{row.gain_pct}%</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </>
-            )}
-            {gainsLiftNote && (
-              <p className="aw-gains-note">{gainsLiftNote}</p>
-            )}
-          </div>
-        )}
-
         {/* Model Leaderboard Header */}
         <div className="aw-lb-header">
           <div>
@@ -754,10 +755,13 @@ export default function StepResults({ runId, onBack }: Props) {
                   <label><strong>{col}</strong></label>
                   <input
                     type="text"
-                    placeholder={`Enter ${col}`}
+                    placeholder={predictHints[col] ? col : `Value for ${col}`}
                     value={featureValues[col]}
                     onChange={(e) => setFeatureValues(prev => ({ ...prev, [col]: e.target.value }))}
                   />
+                  <p className="aw-predict-field-hint">
+                    {predictHints[col] || hintFromColumnName(col, '')}
+                  </p>
                 </div>
               ))}
             </div>

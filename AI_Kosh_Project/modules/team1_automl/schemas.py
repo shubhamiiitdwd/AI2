@@ -55,6 +55,10 @@ class UseCaseSuggestion(BaseModel):
 class UseCaseSuggestionsResponse(BaseModel):
     dataset_id: str
     suggestions: list[UseCaseSuggestion]
+    # Optional: filled when Azure (or future LLM) returns structured rationale
+    reasoning: str = ""
+    confidence: str = ""
+    recommended_task: str = ""
 
 
 class ValidateConfigRequest(BaseModel):
@@ -95,6 +99,8 @@ class TrainingStatusResponse(BaseModel):
     progress_percent: int = 0
     current_stage: str = ""
     message: str = ""
+    # Detailed lines for clustering / training progress when exposed by the backend
+    logs: list[str] = Field(default_factory=list)
 
 
 class ModelResult(BaseModel):
@@ -357,6 +363,9 @@ class DatasetWorkflowInsightResponse(BaseModel):
     headline: str
     detail: str
     source: str = "rules"
+    data_characteristics: str = ""
+    preprocessing_guidance: str = ""
+    feature_engineering_guidance: str = ""
 
 
 class ClusteringLabeledPreviewResponse(BaseModel):

@@ -45,6 +45,9 @@ export interface UseCaseSuggestion {
 export interface UseCaseSuggestionsResponse {
   dataset_id: string;
   suggestions: UseCaseSuggestion[];
+  reasoning?: string;
+  confidence?: string;
+  recommended_task?: string;
 }
 
 export interface AISummaryResponse {
@@ -88,6 +91,8 @@ export interface TrainingStatusResponse {
   progress_percent: number;
   current_stage: string;
   message: string;
+  /** Backend may return incremental training / clustering log lines */
+  logs?: string[];
 }
 
 export interface TrainingRunSummary {
@@ -117,6 +122,9 @@ export interface DatasetWorkflowInsightResponse {
   headline: string;
   detail: string;
   source?: string;
+  data_characteristics?: string;
+  preprocessing_guidance?: string;
+  feature_engineering_guidance?: string;
 }
 
 export interface ClusteringLabeledPreviewResponse {

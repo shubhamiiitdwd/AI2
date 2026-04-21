@@ -235,6 +235,10 @@
   background: color-mix(in srgb, var(--accent-green) 18%, transparent);
   color: var(--accent-green);
 }
+.mx-activity-badge--purple {
+  background: color-mix(in srgb, var(--accent-purple) 20%, transparent);
+  color: var(--accent-purple);
+}
 .mx-activity-check {
   color: var(--accent-green);
   font-weight: 700;

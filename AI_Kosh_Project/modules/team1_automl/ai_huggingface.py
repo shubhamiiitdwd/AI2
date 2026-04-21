@@ -183,8 +183,14 @@ async def auto_detect_task(
     columns: list[ColumnInfo],
     sample_rows: list[dict],
     filename: str,
+    *,
+    classification_targets: list[str] | None = None,
+    regression_targets: list[str] | None = None,
+    total_rows: int = 0,
 ) -> AutoDetectTaskResponse:
     """Rule-based task detection as fallback when Azure is not available."""
+    cls_allow = set(classification_targets or [])
+    reg_allow = set(regression_targets or [])
     fn = filename.lower()
     candidate_cols = [c for c in columns if not _is_id_like(c.name)]
     numeric_cols = [c for c in candidate_cols if _is_numeric(c)]
@@ -201,13 +207,17 @@ async def auto_detect_task(
 
     for c in candidate_cols:
         nm = c.name.lower()
-        if any(k in nm for k in cls_keywords):
+        if cls_allow and c.name in cls_allow:
+            cls_score += 35
+        if reg_allow and c.name in reg_allow:
+            reg_score += 35
+        if any(k in nm for k in cls_keywords) and (not cls_allow or c.name in cls_allow):
             cls_score += 30
-        if any(k in nm for k in reg_keywords):
+        if any(k in nm for k in reg_keywords) and (not reg_allow or c.name in reg_allow):
             reg_score += 30
-        if c.dtype == "object" and c.unique_count <= 20:
+        if c.dtype == "object" and c.unique_count <= 20 and (not cls_allow or c.name in cls_allow):
             cls_score += 5
-        if _is_numeric(c) and c.unique_count > 50:
+        if _is_numeric(c) and c.unique_count > 50 and (not reg_allow or c.name in reg_allow):
             reg_score += 5
 
     if any(k in fn for k in clust_keywords):
@@ -227,11 +237,18 @@ async def auto_detect_task(
     scores = {"classification": cls_score, "regression": reg_score, "clustering": clust_score}
     task = max(scores, key=scores.get)  # type: ignore
     if all(v == 0 for v in scores.values()):
-        task = "classification"
+        if cls_allow:
+            task = "classification"
+        elif reg_allow:
+            task = "regression"
+        else:
+            task = "clustering"
 
     conf = "high" if scores[task] >= 40 else ("medium" if scores[task] >= 20 else "low")
 
-    suggestions = _build_rule_based_suggestions(columns, candidate_cols, numeric_cols, filename)
+    suggestions = _build_rule_based_suggestions(
+        columns, candidate_cols, numeric_cols, filename, cls_allow, reg_allow, total_rows
+    )
 
     return AutoDetectTaskResponse(
         task=task,
@@ -246,11 +263,26 @@ async def suggest_usecases(
     columns: list[ColumnInfo],
     sample_rows: list[dict],
     filename: str,
-) -> list[UseCaseSuggestion]:
-    """Rule-based use-case suggestion fallback."""
+    *,
+    classification_targets: list[str] | None = None,
+    regression_targets: list[str] | None = None,
+    total_rows: int = 0,
+) -> tuple[list[UseCaseSuggestion], dict]:
+    """Rule-based use-case suggestion fallback. Returns (suggestions, meta); meta empty for HF."""
     candidate_cols = [c for c in columns if not _is_id_like(c.name)]
     numeric_cols = [c for c in candidate_cols if _is_numeric(c)]
-    return _build_rule_based_suggestions(columns, candidate_cols, numeric_cols, filename)
+    cls_allow = set(classification_targets) if classification_targets is not None else None
+    reg_allow = set(regression_targets) if regression_targets is not None else None
+    out = _build_rule_based_suggestions(
+        columns,
+        candidate_cols,
+        numeric_cols,
+        filename,
+        classification_allow=cls_allow,
+        regression_allow=reg_allow,
+        total_rows=total_rows,
+    )
+    return out, {}
 
 
 def _build_rule_based_suggestions(
@@ -258,6 +290,9 @@ def _build_rule_based_suggestions(
     candidate_cols: list[ColumnInfo],
     numeric_cols: list[ColumnInfo],
     filename: str,
+    classification_allow: set[str] | None = None,
+    regression_allow: set[str] | None = None,
+    total_rows: int = 0,
 ) -> list[UseCaseSuggestion]:
     """Shared logic for building rule-based suggestions."""
     cls_keywords = ("class", "label", "species", "segment", "status", "category",
@@ -270,37 +305,56 @@ def _build_rule_based_suggestions(
     for c in candidate_cols[:10]:
         nm = c.name.lower()
         if any(k in nm for k in cls_keywords):
-            suggestions.append(UseCaseSuggestion(
-                use_case=f"Classify {c.name} from the remaining features",
-                ml_task="classification",
-                target_hint=c.name,
-            ))
-        if any(k in nm for k in reg_keywords):
-            suggestions.append(UseCaseSuggestion(
-                use_case=f"Predict {c.name} using regression",
-                ml_task="regression",
-                target_hint=c.name,
-            ))
-
-    if not any(s.ml_task == "classification" for s in suggestions):
-        for c in candidate_cols:
-            if (c.dtype == "object" or c.unique_count <= 20) and not _is_id_like(c.name):
+            if classification_allow is not None and c.name not in classification_allow:
+                pass
+            else:
                 suggestions.append(UseCaseSuggestion(
-                    use_case=f"Classify {c.name} based on other columns",
+                    use_case=f"Classify {c.name} from the remaining features",
                     ml_task="classification",
                     target_hint=c.name,
                 ))
-                break
-
-    if not any(s.ml_task == "regression" for s in suggestions):
-        for c in numeric_cols:
-            if c.unique_count > 20:
+        if any(k in nm for k in reg_keywords):
+            if regression_allow is not None and c.name not in regression_allow:
+                pass
+            else:
                 suggestions.append(UseCaseSuggestion(
-                    use_case=f"Predict {c.name} as a continuous value",
+                    use_case=f"Predict {c.name} using regression",
                     ml_task="regression",
                     target_hint=c.name,
                 ))
-                break
+
+    if not any(s.ml_task == "classification" for s in suggestions):
+        for c in candidate_cols:
+            if _is_id_like(c.name):
+                continue
+            if classification_allow is not None:
+                if c.name not in classification_allow:
+                    continue
+            elif not (2 <= int(c.unique_count or 0) <= 4):
+                continue
+            suggestions.append(UseCaseSuggestion(
+                use_case=f"Classify {c.name} based on other columns (≤4 classes)",
+                ml_task="classification",
+                target_hint=c.name,
+            ))
+            break
+
+    if not any(s.ml_task == "regression" for s in suggestions):
+        n = max(int(total_rows or 0), 1)
+        for c in numeric_cols:
+            if regression_allow is not None:
+                if c.name not in regression_allow:
+                    continue
+            else:
+                u = int(c.unique_count or 0)
+                if u <= 4 or u < max(12, min(200, max(15, n // 25))):
+                    continue
+            suggestions.append(UseCaseSuggestion(
+                use_case=f"Predict {c.name} as a continuous value",
+                ml_task="regression",
+                target_hint=c.name,
+            ))
+            break
 
     if len(numeric_cols) >= 2:
         top_feats = ", ".join(c.name for c in numeric_cols[:3])
@@ -317,4 +371,4 @@ def _build_rule_based_suggestions(
         if key not in seen:
             seen.add(key)
             unique.append(s)
-    return unique[:5]
+    return unique[:6]

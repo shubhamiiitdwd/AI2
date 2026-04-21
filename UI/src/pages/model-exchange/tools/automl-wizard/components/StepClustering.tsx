@@ -193,8 +193,10 @@ export default function StepClustering({
           const pct = st.progress_percent ?? 0;
           progressRef.current = pct;
           setProgress(pct);
-          if (st.message) {
-            const line = `[status] ${st.message}`;
+          if (Array.isArray(st.logs) && st.logs.length > 0) {
+            setLogMessages(st.logs);
+          } else if (st.message) {
+            const line = `[${pct}%] ${st.message}`;
             setLogMessages((prev) => (prev[prev.length - 1] === line ? prev : [...prev, line]));
           }
           if (pct >= 100) {
@@ -713,10 +715,6 @@ export default function StepClustering({
             <h4>Elbow Analysis (KMeans)</h4>
             <p className="cl-elbow-hint">
               Heuristic K = <strong>{elbow.recommended_k}</strong> (best silhouette among KMeans fits for K = 2…10 only).
-            </p>
-            <p className="cl-elbow-explainer">
-              The <strong>leaderboard</strong> picks the best model by a combined score across <em>all</em> algorithms (KMeans, GMM, DBSCAN) and hyperparameters (e.g. K=6 can beat K=5).
-              The elbow chart is only a <em>KMeans-only</em> guide. So silhouette can peak at K=5 here while the global best model uses K=6 — that is expected, not a bug.
             </p>
             {elbowInsightLoading && <p className="cl-elbow-ai-loading">Loading AI insight…</p>}
             {elbowInsight?.text && (

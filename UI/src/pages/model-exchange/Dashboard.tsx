@@ -48,10 +48,16 @@ function formatRelativeTime(createdAt: string): string {
 }
 
 function activityTags(run: TrainingRunSummary): string[] {
-  const raw = [run.ml_task, run.run_type, run.best_algorithm || run.primary_metric].filter(
+  const kind =
+    run.run_type === 'clustering' || run.ml_task === 'clustering' ? 'clustering' : run.ml_task;
+  const raw = [kind, run.run_type, run.best_algorithm || run.primary_metric].filter(
     (x): x is string => typeof x === 'string' && x.trim().length > 0,
   );
   return [...new Set(raw)].slice(0, 4);
+}
+
+function isClusteringRun(run: TrainingRunSummary): boolean {
+  return run.run_type === 'clustering' || run.ml_task === 'clustering';
 }
 
 export default function Dashboard({ onStartProject, onOpenRunResults }: Props) {
@@ -75,8 +81,8 @@ export default function Dashboard({ onStartProject, onOpenRunResults }: Props) {
         (r) => r.created_at && ymdFromCreatedAt(r.created_at) >= fromYmd && !isPlaceholderRun(r),
       );
 
-      const trainingOnly = windowRuns.filter((r) => r.run_type === 'training');
-      const models = trainingOnly.reduce((acc, r) => acc + (r.model_count || 0), 0);
+      // Models = AutoML leaderboard size + clustering candidates evaluated (both stored as model_count).
+      const models = windowRuns.reduce((acc, r) => acc + (r.model_count || 0), 0);
       const sessions = windowRuns.length;
       const datasetIds = new Set(windowRuns.map((r) => r.dataset_id).filter(Boolean));
       const datasets = datasetIds.size;
@@ -84,11 +90,15 @@ export default function Dashboard({ onStartProject, onOpenRunResults }: Props) {
       const ok = windowRuns.filter(runSucceeded).length;
       const successPct = sessions > 0 ? (100 * ok) / sessions : 0;
 
-      const trainingTaskSet = new Set(trainingOnly.map((r) => r.ml_task).filter(Boolean));
-      const clusteringInWindow = windowRuns.some(
-        (r) => r.run_type === 'clustering' || r.ml_task === 'clustering',
-      );
-      const taskKinds = trainingTaskSet.size + (clusteringInWindow ? 1 : 0);
+      const taskKindsSet = new Set<string>();
+      windowRuns.forEach((r) => {
+        const rt = (r.run_type || '').toLowerCase();
+        const mt = (r.ml_task || '').toLowerCase();
+        if (rt === 'clustering' || mt === 'clustering') taskKindsSet.add('clustering');
+        else if (mt === 'classification' || mt === 'regression') taskKindsSet.add(mt);
+        else if (rt === 'training' && mt) taskKindsSet.add(mt);
+      });
+      const taskKinds = taskKindsSet.size;
 
       setStats({
         models,
@@ -141,14 +151,16 @@ export default function Dashboard({ onStartProject, onOpenRunResults }: Props) {
 
       <section className="mx-stats">
         <div className="mx-stat-card">
-          <div className="mx-stat-label">Models Trained</div>
+          <div className="mx-stat-label">Models evaluated</div>
           <div className="mx-stat-row">
             <span className="mx-stat-value">{stats.models}</span>
             <svg className="mx-stat-spark" viewBox="0 0 60 24" aria-hidden><polyline points="0,20 10,16 20,18 30,10 40,14 50,8 60,12" fill="none" strokeWidth="2"/></svg>
           </div>
           <div className="mx-stat-footnote">
             Since {period}
-            {stats.taskKinds > 0 ? ` · ${stats.taskKinds} ML task${stats.taskKinds === 1 ? '' : 's'}` : ''}
+            {stats.taskKinds > 0
+              ? ` · ${stats.taskKinds} task type${stats.taskKinds === 1 ? '' : 's'} (classification / regression / clustering)`
+              : ''}
           </div>
         </div>
         <div className="mx-stat-card">
@@ -157,7 +169,7 @@ export default function Dashboard({ onStartProject, onOpenRunResults }: Props) {
             <span className="mx-stat-value">{stats.sessions}</span>
             <svg className="mx-stat-spark" viewBox="0 0 60 24" aria-hidden><polyline points="0,18 10,12 20,16 30,8 40,14 50,10 60,6" fill="none" strokeWidth="2"/></svg>
           </div>
-          <div className="mx-stat-footnote">Since {period} · completed AutoML jobs</div>
+          <div className="mx-stat-footnote">Since {period} · AutoML and clustering jobs</div>
         </div>
         <div className="mx-stat-card">
           <div className="mx-stat-label">Datasets Processed</div>
@@ -189,11 +201,20 @@ export default function Dashboard({ onStartProject, onOpenRunResults }: Props) {
             {recentRuns.map((run) => {
               const title = run.dataset_name?.trim() || `Run ${run.run_id.slice(0, 8)}`;
               const tags = activityTags(run);
+              const cl = isClusteringRun(run);
               return (
                 <div key={run.run_id} className="mx-activity-item">
                   <div className="mx-activity-info">
                     <span className="mx-activity-title">{title}</span>
-                    <span className="mx-activity-badge mx-activity-badge--green">AutoML</span>
+                    <span
+                      className={
+                        cl
+                          ? 'mx-activity-badge mx-activity-badge--purple'
+                          : 'mx-activity-badge mx-activity-badge--green'
+                      }
+                    >
+                      {cl ? 'Clustering' : 'AutoML'}
+                    </span>
                     <span className="mx-activity-check">✓</span>
                   </div>
                   <button

@@ -150,11 +150,6 @@ export const getRandomRow = async (runId: string) => {
   return data;
 };
 
-export const getGainsLift = async (runId: string) => {
-  const { data } = await api.get(`/team1/results/${runId}/gains-lift`);
-  return data;
-};
-
 export const generateAISummary = async (runId: string): Promise<AISummaryResponse> => {
   const { data } = await api.post(`/team1/results/${runId}/ai-summary`);
   return data;

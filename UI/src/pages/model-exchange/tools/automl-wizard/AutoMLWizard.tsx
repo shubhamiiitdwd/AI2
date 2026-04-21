@@ -140,6 +140,37 @@ const AutoMLWizard = ({ initialOpenRun, onInitialOpenConsumed }: AutoMLWizardPro
     } catch { /* ignore */ }
   };
 
+  /** After importing from data.gov.in: same column prep as upload, then advance to Configure Data (step 1). */
+  const continueAfterCatalogImport = useCallback(async (ds: DatasetMetadata) => {
+    setDataset(ds);
+    try {
+      const colData = await api.getDatasetColumns(ds.id);
+      setColumns(colData.columns);
+      const features = colData.columns
+        .map((c) => c.name)
+        .filter((name) => !/cluster_label|cluster_id|prediction_cluster|_cluster$/i.test(name));
+      setFeatureColumns(features);
+    } catch {
+      /* ignore */
+    }
+    try {
+      const detected = await api.autoDetectTask(ds.id);
+      const t = detected.task as MLTask;
+      setMlTask(t);
+      if (t === 'clustering') {
+        setClusteringRunId(null);
+        setClusteringResult(null);
+        setCompletedSteps((prev) => [...new Set([...prev, 0, 1])]);
+        setStep(1);
+        return;
+      }
+    } catch {
+      /* fall through */
+    }
+    setCompletedSteps((prev) => [...new Set([...prev, 0])]);
+    setStep(1);
+  }, []);
+
   const handleClusteringDatasetSelect = async (ds: DatasetMetadata) => {
     setDataset(ds);
     setMlTask('clustering');
@@ -300,6 +331,7 @@ const AutoMLWizard = ({ initialOpenRun, onInitialOpenConsumed }: AutoMLWizardPro
             <StepSelectDataset
               dataset={dataset}
               onSelect={handleDatasetSelect}
+              onCatalogImportComplete={continueAfterCatalogImport}
               onClusteringSelect={handleClusteringDatasetSelect}
               onContinue={async (taskChoice) => {
                 if (!dataset) return;

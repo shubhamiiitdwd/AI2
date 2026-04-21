@@ -6,6 +6,7 @@ import uuid
 import re
 import math
 import asyncio
+import threading
 import logging
 import json
 import concurrent.futures
@@ -45,6 +46,7 @@ from .enums import MLTask, TrainingStatus
 from . import data_processor
 from . import storage_service
 from . import ai_service
+from .ai_huggingface import _is_id_like as _column_name_id_like
 from . import h2o_engine
 from . import team_db
 from . import clustering_engine
@@ -97,6 +99,9 @@ def _rule_dataset_workflow_insight(
             headline="No column metadata",
             detail="Upload a CSV with readable headers. If this is raw text or logs, use Data Exchange to parse features first.",
             source="rules",
+            data_characteristics="No columns were inferred — the file may be empty, wrong format, or missing a header row.",
+            preprocessing_guidance="Open the file in Data Exchange or a spreadsheet tool: confirm delimiter, encoding (UTF-8), and a single header row.",
+            feature_engineering_guidance="After the dataset parses into columns, revisit this wizard; feature engineering only applies once fields are identifiable.",
         )
 
     n_num = sum(1 for c in columns if (c.dtype or "") in ("int64", "float64", "int32", "float32"))
@@ -134,6 +139,18 @@ def _rule_dataset_workflow_insight(
                 "Use Data Exchange to clean, parse, and engineer features, then return here for AutoML or clustering."
             ),
             source="rules",
+            data_characteristics=(
+                "Semi-structured or unstructured for classic AutoML: long text fields, a single blob column, or mostly "
+                "string columns without clear numeric/categorical signals."
+            ),
+            preprocessing_guidance=(
+                "Use Data Exchange (or similar) to tokenize or split text, standardize dates and IDs, drop empty rows, "
+                "and fix inconsistent labels before training."
+            ),
+            feature_engineering_guidance=(
+                "Plan explicit features from text (keywords, TF-IDF, embeddings), geospatial fields, or nested JSON — "
+                "AutoML expects one row per observation with scalar or low-cardinality categorical inputs."
+            ),
         )
 
     if structured:
@@ -147,6 +164,18 @@ def _rule_dataset_workflow_insight(
                 "Continue with Configure Data, pick a target (for supervised tasks), and run AutoML—or choose Clustering for unsupervised exploration."
             ),
             source="rules",
+            data_characteristics=(
+                f"Tabular layout: {n_num} numeric-like column(s), {n_obj} object/string column(s), {total_rows} rows — "
+                "typical for supervised or clustering workflows."
+            ),
+            preprocessing_guidance=(
+                "Handle missing values and outliers, align dtypes with semantics (e.g. IDs as strings), and cap "
+                "extreme high-cardinality categoricals before training."
+            ),
+            feature_engineering_guidance=(
+                "Optional: scaling for distance-based models, encoding for categoricals, and derived ratios or "
+                "binning for skewed numerics. Revisit Data Exchange if domain-specific transforms are required."
+            ),
         )
 
     return DatasetWorkflowInsightResponse(
@@ -156,6 +185,17 @@ def _rule_dataset_workflow_insight(
         headline="Likely tabular — review columns in the next step",
         detail="This CSV is probably usable for AutoML or clustering. If any column is raw text, drop or transform it before training.",
         source="rules",
+        data_characteristics=(
+            f"Mixed or ambiguous structure across {total_cols} columns — treat as tabular candidate but verify each "
+            "column’s role before modeling."
+        ),
+        preprocessing_guidance=(
+            "Inspect dtypes, null rates, and cardinality in Configure Data; fix misclassified columns and leakage risks."
+        ),
+        feature_engineering_guidance=(
+            "If performance is weak, try feature interactions or encoding changes in Data Exchange, then re-import or "
+            "re-upload the refined CSV."
+        ),
     )
 
 
@@ -177,6 +217,9 @@ async def get_dataset_workflow_insight(dataset_id: str) -> DatasetWorkflowInsigh
         if not hasattr(ai, "dataset_workflow_insight"):
             return base
         data = await ai.dataset_workflow_insight(columns, ds.filename, ds.total_rows, ds.total_columns)
+        dc = str(data.get("data_characteristics") or "").strip()
+        pg = str(data.get("preprocessing_guidance") or "").strip()
+        fe = str(data.get("feature_engineering_guidance") or "").strip()
         return DatasetWorkflowInsightResponse(
             is_structured_tabular=bool(data.get("is_structured_tabular", base.is_structured_tabular)),
             needs_data_exchange=bool(data.get("needs_data_exchange", base.needs_data_exchange)),
@@ -184,16 +227,23 @@ async def get_dataset_workflow_insight(dataset_id: str) -> DatasetWorkflowInsigh
             headline=data.get("headline") or base.headline,
             detail=data.get("detail") or base.detail,
             source="azure",
+            data_characteristics=dc or base.data_characteristics,
+            preprocessing_guidance=pg or base.preprocessing_guidance,
+            feature_engineering_guidance=fe or base.feature_engineering_guidance,
         )
     except Exception as e:
         logger.debug("dataset_workflow_insight Azure fallback: %s", e)
         return base
 
 
-async def upload_dataset(file: UploadFile) -> DatasetMetadata:
-    content = await file.read()
-    filename = file.filename or "dataset.csv"
-
+def register_dataset_from_bytes(
+    filename: str,
+    content: bytes,
+    *,
+    category: str | None = None,
+    description: str | None = None,
+) -> DatasetMetadata:
+    """Save bytes like an upload and persist metadata (used by multipart upload and data.gov.in import)."""
     existing = team_db.find_dataset_by_filename(filename)
     if existing:
         storage = storage_service.get_storage()
@@ -208,8 +258,21 @@ async def upload_dataset(file: UploadFile) -> DatasetMetadata:
     filepath = storage.save_dataset(dataset_id, filename, content)
 
     meta = data_processor.get_metadata(filepath, dataset_id, filename)
+    updates: dict = {}
+    if category is not None:
+        updates["category"] = category
+    if description is not None:
+        updates["description"] = description
+    if updates:
+        meta = meta.model_copy(update=updates)
     team_db.save_dataset(meta)
     return meta
+
+
+async def upload_dataset(file: UploadFile) -> DatasetMetadata:
+    content = await file.read()
+    filename = file.filename or "dataset.csv"
+    return register_dataset_from_bytes(filename, content)
 
 
 async def list_datasets() -> list[DatasetMetadata]:
@@ -267,17 +330,77 @@ async def suggest_usecases(dataset_id: str) -> UseCaseSuggestionsResponse:
     columns_info = data_processor.get_columns(filepath, dataset_id)
 
     import pandas as pd
-    sample_rows = pd.read_csv(filepath, nrows=15).fillna("").to_dict(orient="records")
+
+    cols_all = columns_info.columns
+    cols_ai = cols_all[:40]
+    cls_targets = [c.name for c in _classification_target_columns(cols_all)]
+    reg_targets = [c.name for c in _regression_target_columns(cols_all, ds.total_rows)]
+    sample_rows = pd.read_csv(filepath, nrows=25).fillna("").to_dict(orient="records")
 
     ai = ai_service.get_ai_service()
     try:
-        suggestions = await ai.suggest_usecases(columns_info.columns, sample_rows, ds.filename)
-        return UseCaseSuggestionsResponse(dataset_id=dataset_id, suggestions=suggestions)
+        suggestions, meta = await ai.suggest_usecases(
+            cols_ai,
+            sample_rows,
+            ds.filename,
+            classification_targets=cls_targets,
+            regression_targets=reg_targets,
+            total_rows=int(ds.total_rows or 0),
+        )
+        return UseCaseSuggestionsResponse(
+            dataset_id=dataset_id,
+            suggestions=suggestions,
+            reasoning=str(meta.get("reasoning", "") or ""),
+            confidence=str(meta.get("confidence", "") or ""),
+            recommended_task=str(meta.get("task", "") or ""),
+        )
     except Exception as exc:
         logger.warning("AI use-case suggestion failed, falling back to built-in rules: %s", exc)
+        from . import ai_huggingface
 
-    suggestions = _generate_usecase_suggestions(columns_info.columns, ds.filename)
-    return UseCaseSuggestionsResponse(dataset_id=dataset_id, suggestions=suggestions)
+        suggestions, _ = await ai_huggingface.suggest_usecases(
+            cols_ai,
+            sample_rows,
+            ds.filename,
+            classification_targets=cls_targets,
+            regression_targets=reg_targets,
+            total_rows=int(ds.total_rows or 0),
+        )
+        return UseCaseSuggestionsResponse(dataset_id=dataset_id, suggestions=suggestions)
+
+
+def _classification_target_columns(columns: list[ColumnInfo]) -> list[ColumnInfo]:
+    """Targets valid for classification in this app: 2–4 distinct classes only."""
+    out: list[ColumnInfo] = []
+    for c in columns:
+        if _column_name_id_like(c.name):
+            continue
+        u = int(c.unique_count or 0)
+        if 2 <= u <= 4:
+            out.append(c)
+    return sorted(out, key=lambda x: (-int(x.unique_count or 0), x.name))
+
+
+def _regression_target_columns(columns: list[ColumnInfo], total_rows: int) -> list[ColumnInfo]:
+    """Numeric columns with enough distinct values to behave as a regression target (not low-cardinality class)."""
+    n = max(int(total_rows or 0), 1)
+    out: list[ColumnInfo] = []
+    for c in columns:
+        if _column_name_id_like(c.name):
+            continue
+        dt = (c.dtype or "").lower()
+        u = int(c.unique_count or 0)
+        if dt not in ("float64", "float32", "int64", "int32"):
+            continue
+        if u <= 4:
+            continue
+        min_unique = max(12, min(200, max(15, n // 25)))
+        if u < min_unique:
+            continue
+        if "int" in dt and u > n * 0.97 and n > 100:
+            continue
+        out.append(c)
+    return sorted(out, key=lambda x: (-int(x.unique_count or 0), x.name))[:20]
 
 
 async def auto_detect_task(dataset_id: str) -> AutoDetectTaskResponse:
@@ -289,16 +412,36 @@ async def auto_detect_task(dataset_id: str) -> AutoDetectTaskResponse:
     columns_info = data_processor.get_columns(filepath, dataset_id)
 
     import pandas as pd
-    sample_rows = pd.read_csv(filepath, nrows=15).fillna("").to_dict(orient="records")
+
+    cols_all = columns_info.columns
+    cols_ai = cols_all[:40]
+    sample_rows = pd.read_csv(filepath, nrows=25).fillna("").to_dict(orient="records")
+    cls_targets = [c.name for c in _classification_target_columns(cols_all)]
+    reg_targets = [c.name for c in _regression_target_columns(cols_all, ds.total_rows)]
 
     ai = ai_service.get_ai_service()
     try:
-        return await ai.auto_detect_task(columns_info.columns, sample_rows, ds.filename)
+        return await ai.auto_detect_task(
+            cols_ai,
+            sample_rows,
+            ds.filename,
+            classification_targets=cls_targets,
+            regression_targets=reg_targets,
+            total_rows=int(ds.total_rows or 0),
+        )
     except Exception as exc:
         logger.warning("AI auto-detect failed, using rule-based: %s", exc)
 
     from . import ai_huggingface
-    return await ai_huggingface.auto_detect_task(columns_info.columns, sample_rows, ds.filename)
+
+    return await ai_huggingface.auto_detect_task(
+        cols_ai,
+        sample_rows,
+        ds.filename,
+        classification_targets=cls_targets,
+        regression_targets=reg_targets,
+        total_rows=int(ds.total_rows or 0),
+    )
 
 
 async def _generate_usecase_suggestions_gpt(columns: list[ColumnInfo], filename: str) -> list[UseCaseSuggestion]:
@@ -1119,13 +1262,20 @@ async def get_training_status(run_id: str) -> TrainingStatusResponse:
             status=TrainingStatus(db_run["status"]),
             progress_percent=100 if db_run["status"] == "complete" else 0,
             current_stage=db_run["status"],
+            logs=[],
         )
+    log_src = run.get("logs") or []
+    log_lines = [
+        f"[{e.get('progress', run.get('progress', 0))}%] {e.get('message', '')}"
+        for e in log_src[-120:]
+    ]
     return TrainingStatusResponse(
         run_id=run_id,
         status=run["status"],
         progress_percent=run["progress"],
         current_stage=run["stage"],
-        message=run["logs"][-1]["message"] if run["logs"] else "",
+        message=log_src[-1]["message"] if log_src else "",
+        logs=log_lines,
     )
 
 
@@ -1273,13 +1423,16 @@ async def get_best_model(run_id: str):
 
     target_column = ""
     feature_columns = []
+    dataset_id = ""
     if run and run.get("request"):
         req = run["request"]
         target_column = req.target_column
         feature_columns = req.feature_columns
+        dataset_id = getattr(req, "dataset_id", "") or ""
     elif result.get("config"):
         target_column = result["config"].get("target_column", "")
         feature_columns = result["config"].get("feature_columns", [])
+        dataset_id = str(result["config"].get("dataset_id", "") or "")
 
     ml_task_res = result.get("ml_task", "")
     n_cls = int(result.get("n_target_classes", 2))
@@ -1377,6 +1530,7 @@ async def get_best_model(run_id: str):
         "ml_task": ml_task_res,
         "target_column": target_column,
         "feature_columns": feature_columns,
+        "dataset_id": dataset_id,
         "evaluation_warnings": evaluation_warnings,
         "metrics_eval_set": metrics_eval_set,
         "metrics_eval_rows": metrics_eval_rows,
@@ -1935,6 +2089,27 @@ def _rule_based_summary(
 # Clustering AutoML Pipeline
 # ═══════════════════════════════════════════════════════════════════════════
 
+
+def _append_clustering_run_log(run: dict, progress_pct: int, message: str) -> None:
+    """Thread-safe progress, message, and log lines (HTTP status reads `progress` + `logs`)."""
+    line = f"[{progress_pct}%] {message}"
+    lock = run.get("log_lock")
+
+    def _body() -> None:
+        run["progress"] = progress_pct
+        run["message"] = message
+        lines: list = run.setdefault("log_lines", [])
+        lines.append(line)
+        if len(lines) > 400:
+            del lines[: len(lines) - 300]
+
+    if lock:
+        with lock:
+            _body()
+    else:
+        _body()
+
+
 _clustering_runs: dict[str, dict] = {}
 _clustering_ws: dict[str, list[WebSocket]] = {}
 
@@ -1978,6 +2153,8 @@ async def start_clustering(req: ClusteringStartRequest) -> ClusteringStartRespon
         "status": "queued",
         "progress": 0,
         "message": "Queued",
+        "log_lines": [],
+        "log_lock": threading.Lock(),
         "request": req,
         "dataset": ds,
         "result": None,
@@ -1992,8 +2169,7 @@ async def start_clustering(req: ClusteringStartRequest) -> ClusteringStartRespon
 async def _clustering_broadcast(run_id: str, pct: int, msg: str):
     run = _clustering_runs.get(run_id)
     if run:
-        run["progress"] = pct
-        run["message"] = msg
+        _append_clustering_run_log(run, pct, msg)
 
     payload = json.dumps({
         "type": "progress",
@@ -2029,10 +2205,9 @@ async def _run_clustering(run_id: str):
         filepath = storage.get_dataset_path(req.dataset_id, ds.filename)
         df = pd.read_csv(filepath)
 
-        progress_events: list[tuple[int, str]] = []
-
         def progress_cb(pct, msg):
-            progress_events.append((pct, msg))
+            # Record while the sync pipeline runs in the executor so HTTP polling shows live detail.
+            _append_clustering_run_log(run, pct, msg)
 
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
@@ -2048,9 +2223,6 @@ async def _run_clustering(run_id: str):
                 progress_callback=progress_cb,
             ),
         )
-
-        for pct, msg in progress_events:
-            await _clustering_broadcast(run_id, pct, msg)
 
         sanitized = _sanitize_for_json(result)
         run["result"] = sanitized
@@ -2147,17 +2319,26 @@ async def get_clustering_status(run_id: str) -> TrainingStatusResponse:
             status=TrainingStatus(db_run["status"]),
             progress_percent=100 if db_run["status"] == "complete" else 0,
             current_stage=db_run["status"],
+            logs=[],
         )
     try:
         st = TrainingStatus(run["status"])
     except ValueError:
         st = TrainingStatus.TRAINING
+    log_lock = run.get("log_lock")
+    log_lines = run.get("log_lines") or []
+    if log_lock:
+        with log_lock:
+            tail_logs = list(log_lines[-120:])
+    else:
+        tail_logs = list(log_lines[-120:])
     return TrainingStatusResponse(
         run_id=run_id,
         status=st,
         progress_percent=run["progress"],
         current_stage=run["status"],
         message=run["message"],
+        logs=tail_logs,
     )
 
 

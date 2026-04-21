@@ -21,8 +21,10 @@ from .schemas import (
 )
 from . import services
 from . import hf_datasets
+from . import data_gov_catalog
 
 router = APIRouter(prefix="/team1", tags=["Team 1 - AutoML"])
+router.include_router(data_gov_catalog.router)
 
 
 # ── Dataset Management ─────────────────────────────────────────────────────
