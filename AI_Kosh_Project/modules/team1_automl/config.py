@@ -70,6 +70,14 @@ AZURE_BLOB_CONTAINER_NAME = (
 )
 # Root "folder" inside the container: datasets, models, results live under {prefix}/datasets/..., etc.
 AZURE_STORAGE_AUTOML_PREFIX = os.getenv("AZURE_STORAGE_AUTOML_PREFIX", "automl").strip().strip("/")
+# Shared module datasets: paths are relative to the blob container (e.g. aikosh-v2), NOT under AZURE_STORAGE_AUTOML_PREFIX.
+# Empty = list from container "root" (portal folders like anonymization/, feature eng/, automl/ appear as groups).
+# Set to e.g. "automl/module_datasets" if files only live under that prefix.
+AZURE_BLOB_DATA_LIBRARY_CONTAINER_PREFIX = (
+    (os.getenv("AZURE_BLOB_DATA_LIBRARY_CONTAINER_PREFIX") or os.getenv("AZURE_BLOB_DATA_LIBRARY_PATH") or "")
+    .strip()
+    .strip("/")
+)
 
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
@@ -97,5 +105,11 @@ GROQ_MODEL = (os.getenv("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()
 NVIDIA_API_KEY = (os.getenv("NVIDIA_API_KEY") or "").strip()
 NVIDIA_MODEL = (os.getenv("NVIDIA_MODEL") or "meta/llama-3.3-70b-instruct").strip()
 
-for d in [RAW_UPLOADS_DIR, PROCESSED_DATA_DIR, MODELS_DIR, DATA_GOV_STAGING_DIR]:
+DATA_LIBRARY_LOCAL_ROOT = (
+    Path(os.getenv("DATA_LIBRARY_LOCAL_DIR", "")).resolve()
+    if (os.getenv("DATA_LIBRARY_LOCAL_DIR") or "").strip()
+    else (SHARED_WORKSPACE / "data_library")
+)
+
+for d in [RAW_UPLOADS_DIR, PROCESSED_DATA_DIR, MODELS_DIR, DATA_GOV_STAGING_DIR, DATA_LIBRARY_LOCAL_ROOT]:
     d.mkdir(parents=True, exist_ok=True)

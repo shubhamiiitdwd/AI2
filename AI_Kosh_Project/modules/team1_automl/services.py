@@ -41,6 +41,8 @@ from .schemas import (
     DatasetWorkflowInsightResponse,
     ClusteringLabeledPreviewResponse,
     TextInsightResponse,
+    DataLibraryFileRef, DataLibraryFolderInfo, DataLibraryIndexResponse,
+    DataLibraryImportRequest, DataLibraryImportResponse,
 )
 from .enums import MLTask, TrainingStatus
 from . import data_processor
@@ -279,6 +281,212 @@ async def list_datasets() -> list[DatasetMetadata]:
     return team_db.list_datasets()
 
 
+def list_data_library_index() -> DataLibraryIndexResponse:
+    storage = storage_service.get_storage()
+    list_fn = getattr(storage, "list_data_library", None)
+    if not callable(list_fn):
+        return DataLibraryIndexResponse(source="none", folders=[])
+    try:
+        raw: list[dict] = list_fn()  # type: ignore[assignment]
+    except Exception as e:
+        logger.warning("list_data_library: %s", e)
+        return DataLibraryIndexResponse(source="none", folders=[])
+
+    folders: list[DataLibraryFolderInfo] = []
+    for item in raw:
+        files = [
+            DataLibraryFileRef(name=str(f.get("name") or ""), size_bytes=int(f.get("size_bytes") or 0))
+            for f in (item.get("files") or [])
+            if f.get("name")
+        ]
+        if files:
+            folders.append(DataLibraryFolderInfo(folder=str(item.get("folder") or ""), files=files))
+    return DataLibraryIndexResponse(
+        source="azure" if STORAGE_MODE == "azure" else "local",
+        folders=folders,
+    )
+
+
+_LIBRARY_REJECT_SUFFIX = (
+    " This file is not supported in the AutoML module, which only accepts tabular datasets for "
+    "classification, regression, or clustering. Choose another file from the module library, upload a different CSV, "
+    "or use Data Exchange to prepare your data first."
+)
+
+
+async def import_data_library_dataset(req: DataLibraryImportRequest) -> DataLibraryImportResponse:
+    storage = storage_service.get_storage()
+    down = getattr(storage, "download_data_library_file", None)
+    if not callable(down):
+        raise HTTPException(501, "Data library is not available in this deployment (storage backend missing).")
+
+    folder = (req.folder or "").strip()
+    filename = (req.filename or "").strip()
+    if not folder or not filename:
+        raise HTTPException(400, "folder and filename are required")
+
+    try:
+        content: bytes = down(folder, filename)  # type: ignore[misc]
+    except Exception as e:
+        logger.warning("Data library download failed: %s", e)
+        raise HTTPException(404, "File not found in the data library") from e
+
+    leaf = filename.rsplit("/", 1)[-1].strip() or "dataset.csv"
+    meta = register_dataset_from_bytes(
+        leaf,
+        content,
+        category=f"Module library / {folder}",
+        description="Imported from shared module data library (Azure/local)",
+    )
+    try:
+        insight = await get_dataset_workflow_insight(meta.id)
+    except Exception as e:
+        await delete_dataset(meta.id)
+        raise HTTPException(500, f"Failed to profile imported file: {e}") from e
+
+    if not insight.is_structured_tabular:
+        await delete_dataset(meta.id)
+        base = f"{insight.headline} {insight.detail}".strip()
+        if insight.data_characteristics:
+            base = f"{base} {insight.data_characteristics}".strip()
+        msg = (base or "This file does not look like structured, tabular data for AutoML.") + _LIBRARY_REJECT_SUFFIX
+        if AI_MODE == "azure" and (
+            (insight.preprocessing_guidance and len(insight.preprocessing_guidance) > 20)
+            or (insight.feature_engineering_guidance and len(insight.feature_engineering_guidance) > 20)
+        ):
+            msg = f"{base}\n\n{insight.preprocessing_guidance} {insight.feature_engineering_guidance}".strip() + _LIBRARY_REJECT_SUFFIX
+        return DataLibraryImportResponse(accepted=False, message=msg, insight=insight)
+
+    return DataLibraryImportResponse(accepted=True, dataset=meta, insight=insight)
+
+
+def _heuristic_mall_customers_clustering(filename: str, columns: list[ColumnInfo]) -> bool:
+    """
+    UCI / Kaggle Mall Customers pattern: filename OR columns (income + spending, optional Age/Gender).
+    """
+    fn = re.sub(r"[^a-z0-9]+", " ", (filename or "").lower()).strip()
+    name_mall = "mall" in fn and ("customer" in fn or "customers" in fn)
+    blob = " ".join(c.name.lower() for c in columns)
+    has_spend = "spend" in blob
+    has_income = "income" in blob or "k$" in blob
+    has_demo = "age" in blob or "gender" in blob
+    num_cols = sum(
+        1 for c in columns
+        if (c.dtype or "").lower() in ("int64", "int32", "float64", "float32")
+    )
+    if has_spend and has_income and (has_demo or num_cols >= 2):
+        return True
+    if name_mall and has_spend and has_income:
+        return True
+    if name_mall and has_income and has_demo and num_cols >= 2:
+        return True
+    return False
+
+
+def _no_vetted_supervised_targets(classification_names: list[str], regression_names: list[str]) -> bool:
+    return not classification_names and not regression_names
+
+
+def _filename_suggests_clustering(filename: str) -> bool:
+    """Filename keywords common for unsupervised / segmentation datasets (not exact science)."""
+    fn = (filename or "").lower()
+    keys = (
+        "cluster", "kmeans", "k-means", "k_means", "unsupervis", "unsup_",
+        "segment", "rfm", "grouping", " moons", "blob", "customer_segment", "anomaly_group",
+    )
+    if any(k in fn for k in keys):
+        return True
+    return False
+
+
+def _columns_suggest_unsupervised_grouping(columns: list[ColumnInfo]) -> bool:
+    """Several numeric + optional categoricals — typical for clustering when not a clear Y column."""
+    blob = " ".join(c.name.lower() for c in columns)
+    numish = [
+        c for c in columns
+        if (c.dtype or "").lower() in ("int64", "int32", "float64", "float32")
+    ]
+    if len(numish) >= 3 and any(
+        w in blob for w in (
+            "spend", "income", "revenue", "recency", "frequency", "monetary", "rfm", "amount", "score", "lat", "long",
+        )
+    ):
+        return True
+    return False
+
+
+MALL_CUSTOMERS_AUTO_DETECT_AZURE_HINT = (
+    "The host detected a Mall Customers / customer-segmentation style table. Your JSON field \"task\" MUST be "
+    '"clustering". Unsupervised customer segments (income, spending, age) — NOT classifying Gender as the main task. '
+    "Include a clustering suggestion with target_hint exactly \"No target (unsupervised)\" first."
+)
+
+GENERIC_NO_SUPERVISED_TARGETS_HINT = (
+    "The host found no vetted classification (2–4 classes) or regression targets. For this app, the appropriate "
+    'default is often task \"clustering\" for exploratory grouping / segments, unless the user metadata clearly '
+    'implies a different supervised use case. Include at least one clustering suggestion first when clustering fits.'
+)
+
+FILENAME_CLUSTERING_HINT = (
+    "The file name suggests an unsupervised clustering/segmentation style problem. If columns support finding groups "
+    'without a single prediction target, set \"task\" to \"clustering\" and lead with a clustering use case.'
+)
+
+COLUMN_GROUPING_CLUSTERING_HINT = (
+    "The columns look like a behavioral / RFM / basket-style feature set (several numerics, segment-like names). If the "
+    "goal is to discover customer or entity groups, prefer task \"clustering\" over classifying a weak side column."
+)
+
+
+def _build_clustering_host_hint(
+    filename: str,
+    columns: list[ColumnInfo],
+    cls_t: list[str],
+    reg_t: list[str],
+) -> str | None:
+    """Single strongest hint to append for Azure; None if we add nothing extra."""
+    if _heuristic_mall_customers_clustering(filename, columns):
+        return MALL_CUSTOMERS_AUTO_DETECT_AZURE_HINT
+    if _no_vetted_supervised_targets(cls_t, reg_t) and len(columns) >= 2:
+        return GENERIC_NO_SUPERVISED_TARGETS_HINT
+    if _filename_suggests_clustering(filename):
+        return FILENAME_CLUSTERING_HINT
+    if not reg_t and _columns_suggest_unsupervised_grouping(columns) and len(cls_t) <= 1:
+        return COLUMN_GROUPING_CLUSTERING_HINT
+    return None
+
+
+def _should_force_output_clustering(
+    filename: str,
+    columns: list[ColumnInfo],
+    cls_t: list[str],
+    reg_t: list[str],
+) -> bool:
+    """
+    When to pin task=clustering after auto-detect (Let AI decide → clustering pipeline).
+    Conservative: if vetted regression targets exist, do not force (use Azure / user choice).
+    """
+    if reg_t:
+        if _heuristic_mall_customers_clustering(filename, columns) or _filename_suggests_clustering(filename):
+            return True
+        return False
+    if _heuristic_mall_customers_clustering(filename, columns):
+        return True
+    if _no_vetted_supervised_targets(cls_t, reg_t) and len(columns) >= 2:
+        return True
+    if _filename_suggests_clustering(filename):
+        return True
+    if _columns_suggest_unsupervised_grouping(columns) and len(cls_t) <= 1:
+        return True
+    return False
+
+
+def _prioritize_clustering_suggestions(suggestions: list[UseCaseSuggestion]) -> list[UseCaseSuggestion]:
+    cl = [s for s in suggestions if s.ml_task == "clustering"]
+    rest = [s for s in suggestions if s.ml_task != "clustering"]
+    return (cl + rest)[:6]
+
+
 async def preview_dataset(dataset_id: str, rows: int = 10) -> DatasetPreviewResponse:
     ds = team_db.get_dataset(dataset_id)
     if not ds:
@@ -419,29 +627,56 @@ async def auto_detect_task(dataset_id: str) -> AutoDetectTaskResponse:
     cls_targets = [c.name for c in _classification_target_columns(cols_all)]
     reg_targets = [c.name for c in _regression_target_columns(cols_all, ds.total_rows)]
 
+    host_hint = _build_clustering_host_hint(ds.filename, cols_all, cls_targets, reg_targets)
+    force_clustering = _should_force_output_clustering(ds.filename, cols_all, cls_targets, reg_targets)
+    detect_kw: dict = {
+        "classification_targets": cls_targets,
+        "regression_targets": reg_targets,
+        "total_rows": int(ds.total_rows or 0),
+    }
+    if host_hint:
+        detect_kw["host_task_hint"] = host_hint
+
     ai = ai_service.get_ai_service()
     try:
-        return await ai.auto_detect_task(
+        out = await ai.auto_detect_task(
             cols_ai,
             sample_rows,
             ds.filename,
-            classification_targets=cls_targets,
-            regression_targets=reg_targets,
-            total_rows=int(ds.total_rows or 0),
+            **detect_kw,
         )
     except Exception as exc:
         logger.warning("AI auto-detect failed, using rule-based: %s", exc)
+        from . import ai_huggingface
 
-    from . import ai_huggingface
+        out = await ai_huggingface.auto_detect_task(
+            cols_ai,
+            sample_rows,
+            ds.filename,
+            **detect_kw,
+        )
 
-    return await ai_huggingface.auto_detect_task(
-        cols_ai,
-        sample_rows,
-        ds.filename,
-        classification_targets=cls_targets,
-        regression_targets=reg_targets,
-        total_rows=int(ds.total_rows or 0),
-    )
+    # Pin to clustering for Let-AI-Decide when heuristics + host rules say so (Mall, no Y, filename, RFM-style, etc.)
+    if force_clustering:
+        merged_reason = (out.reasoning or "").strip()
+        if AI_MODE == "azure":
+            prefix = "Azure + host: clustering is the best fit for this table. "
+        else:
+            prefix = "Host rules: clustering is the best fit for this table. "
+        out = out.model_copy(
+            update={
+                "task": "clustering",
+                "reasoning": f"{prefix}{merged_reason}".strip(),
+                "suggestions": _prioritize_clustering_suggestions(list(out.suggestions)),
+            }
+        )
+    elif (out.task or "").lower() == "clustering":
+        out = out.model_copy(
+            update={
+                "suggestions": _prioritize_clustering_suggestions(list(out.suggestions)),
+            }
+        )
+    return out
 
 
 async def _generate_usecase_suggestions_gpt(columns: list[ColumnInfo], filename: str) -> list[UseCaseSuggestion]:

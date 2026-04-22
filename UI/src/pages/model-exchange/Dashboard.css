@@ -163,12 +163,30 @@
   font-weight: 500;
 }
 
-/* ── Bottom Panels ───────────────────────────────────────────────────────── */
+/* ── Bottom Panels (Recent Activity · Session management · Capabilities) ─── */
 .mx-panels {
   display: grid;
   grid-template-columns: 1.2fr 1fr;
   gap: 16px;
   padding: 20px 24px 32px;
+}
+.mx-panels--triple {
+  grid-template-columns: 1fr 1fr 1fr;
+  align-items: stretch;
+}
+.mx-panels--triple .mx-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 280px;
+}
+.mx-panels--triple .mx-panel--capabilities {
+  min-height: 0;
+}
+.mx-panels--triple .mx-activity-list,
+.mx-panels--triple .mx-capabilities,
+.mx-panels--triple .mx-session-card {
+  flex: 1;
+  min-height: 0;
 }
 .mx-panel {
   background: var(--bg-elevated);
@@ -176,6 +194,85 @@
   border-radius: var(--r-md);
   padding: 24px;
   box-shadow: var(--shadow-sm);
+}
+.mx-panel--session .mx-panel-header h3 {
+  color: var(--t-primary);
+}
+/* ── Session management panel ───────────────────────────────────────────── */
+.mx-session-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+}
+.mx-session-activity {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--t-primary);
+  line-height: 1.45;
+}
+.mx-session-time {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--t-muted);
+}
+.mx-session-time-label {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--t-secondary);
+}
+.mx-session-time time {
+  color: var(--t-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.mx-session-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 4px;
+}
+.mx-session-btn {
+  border-radius: var(--r-md);
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--border-mid);
+  background: var(--bg-surface);
+  color: var(--t-secondary);
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+.mx-session-btn:hover:not(:disabled) {
+  color: var(--t-primary);
+  border-color: var(--brand);
+}
+.mx-session-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.mx-session-btn--primary {
+  background: color-mix(in srgb, var(--brand) 16%, var(--bg-surface));
+  border-color: color-mix(in srgb, var(--brand) 50%, var(--border-mid));
+  color: var(--brand);
+}
+.mx-session-btn--primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--brand) 26%, var(--bg-surface));
+}
+.mx-session-empty {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--t-muted);
+  padding: 8px 0 0;
+  flex: 1;
+}
+.mx-session-empty strong {
+  color: var(--t-secondary);
+  font-weight: 600;
 }
 .mx-panel-header h3 {
   font-size: 18px;
@@ -196,6 +293,14 @@
 }
 
 /* ── Recent Activity ─────────────────────────────────────────────────────── */
+.mx-panels--triple .mx-capabilities {
+  max-height: 360px;
+  overflow-y: auto;
+}
+.mx-panel--activity .mx-activity-list {
+  max-height: 360px;
+  overflow: auto;
+}
 .mx-activity-list {
   display: flex;
   flex-direction: column;

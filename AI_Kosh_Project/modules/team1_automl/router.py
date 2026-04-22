@@ -18,6 +18,7 @@ from .schemas import (
     DatasetWorkflowInsightResponse,
     ClusteringLabeledPreviewResponse,
     TextInsightResponse,
+    DataLibraryIndexResponse, DataLibraryImportRequest, DataLibraryImportResponse,
 )
 from . import services
 from . import hf_datasets
@@ -49,6 +50,16 @@ async def browse_hf_datasets(task: Optional[str] = Query(default=None)):
 async def import_hf_dataset(req: HFImportRequest):
     result = await hf_datasets.import_hf_dataset(req.hf_id)
     return result
+
+
+@router.get("/datasets/data-library", response_model=DataLibraryIndexResponse)
+def list_data_library():
+    return services.list_data_library_index()
+
+
+@router.post("/datasets/data-library/import", response_model=DataLibraryImportResponse)
+async def import_data_library(req: DataLibraryImportRequest):
+    return await services.import_data_library_dataset(req)
 
 
 @router.get("/datasets/{dataset_id}/preview", response_model=DatasetPreviewResponse)

@@ -1,8 +1,16 @@
 import { useState, useRef, useEffect } from 'react';
-import type { DatasetMetadata, DatasetWorkflowInsightResponse } from '../types';
+import { useNavigate } from 'react-router-dom';
+import type { DatasetMetadata, DatasetWorkflowInsightResponse, DataLibraryIndexResponse } from '../types';
 import * as api from '../api';
 import { aiSourceDisplay } from '../aiSource';
 import CatalogView from '../catalog/CatalogView';
+
+/** Matches backend Azure: loose blobs at container prefix root. */
+const DATA_LIBRARY_ROOT_FOLDER = '__root__';
+
+function dataLibraryFolderLabel(folderId: string): string {
+  return folderId === DATA_LIBRARY_ROOT_FOLDER ? 'Container root' : folderId;
+}
 
 type TaskChoice = 'auto' | 'classification' | 'regression' | 'clustering';
 
@@ -24,6 +32,7 @@ export default function StepSelectDataset({
   onContinue,
   onClearDataset,
 }: Props) {
+  const navigate = useNavigate();
   const [datasets, setDatasets] = useState<DatasetMetadata[]>([]);
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
@@ -32,10 +41,40 @@ export default function StepSelectDataset({
   const [workflowInsight, setWorkflowInsight] = useState<DatasetWorkflowInsightResponse | null>(null);
   const [insightLoading, setInsightLoading] = useState(false);
   const [catalogOpen, setCatalogOpen] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [libraryIndex, setLibraryIndex] = useState<DataLibraryIndexResponse | null>(null);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
+  const [libraryImporting, setLibraryImporting] = useState(false);
+  const [libraryExpanded, setLibraryExpanded] = useState<string | null>(null);
 
   useEffect(() => {
     api.listDatasets().then(setDatasets).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!libraryOpen) return;
+    setLibraryError(null);
+    setLibraryLoading(true);
+    setLibraryIndex(null);
+    api
+      .listDataLibrary()
+      .then((idx) => {
+        setLibraryIndex(idx);
+        const sorted = [...idx.folders].sort((a, b) => {
+          if (a.folder === DATA_LIBRARY_ROOT_FOLDER) return 1;
+          if (b.folder === DATA_LIBRARY_ROOT_FOLDER) return -1;
+          return a.folder.localeCompare(b.folder, undefined, { sensitivity: 'base' });
+        });
+        if (sorted.length > 0) setLibraryExpanded(sorted[0].folder);
+      })
+      .catch(() => {
+        setLibraryError(
+          'Could not list module datasets. Check storage connection and AZURE_BLOB_DATA_LIBRARY_CONTAINER_PREFIX in the API .env.',
+        );
+      })
+      .finally(() => setLibraryLoading(false));
+  }, [libraryOpen]);
 
   useEffect(() => {
     if (!dataset?.id) {
@@ -126,16 +165,6 @@ export default function StepSelectDataset({
               </div>
             </div>
 
-            <div className="aw-dataset-nav-actions">
-              <button
-                type="button"
-                className="aw-btn aw-btn--secondary aw-dataset-nav-actions__btn"
-                title="Navigation to Data Exchange will be wired later"
-                onClick={() => {}}
-              >
-                Data Exchange
-              </button>
-            </div>
 
             {(insightLoading || workflowInsight) && (
               <div className="aw-dataset-insight">
@@ -174,7 +203,7 @@ export default function StepSelectDataset({
                     {workflowInsight.needs_data_exchange && (
                       <p className="aw-insight-exchange-hint">
                         This dataset likely needs work in <strong>Data Exchange</strong> before reliable AutoML.
-                        Use the Data Exchange button above when navigation is available.
+                        Use the <strong>Data Exchange</strong> button next to Continue below to open the Data Exchange module.
                       </p>
                     )}
                   </>
@@ -203,19 +232,30 @@ export default function StepSelectDataset({
               )}
             </div>
 
-            <button
-              className="aw-btn aw-btn--primary aw-btn--full"
-              onClick={async () => {
-                if (!dataset) return;
-                if (taskChoice === 'clustering' && onClusteringSelect) {
-                  onClusteringSelect(dataset);
-                  return;
-                }
-                await onContinue?.(taskChoice);
-              }}
-            >
-              {taskChoice === 'clustering' ? 'Start Clustering Pipeline →' : 'Continue to Configure Data →'}
-            </button>
+            <div className="aw-dataset-cta-row">
+              <button
+                type="button"
+                className="aw-btn aw-btn--secondary"
+                onClick={() => {
+                  void navigate('/aisphere/data');
+                }}
+              >
+                Data Exchange
+              </button>
+              <button
+                className="aw-btn aw-btn--primary"
+                onClick={async () => {
+                  if (!dataset) return;
+                  if (taskChoice === 'clustering' && onClusteringSelect) {
+                    onClusteringSelect(dataset);
+                    return;
+                  }
+                  await onContinue?.(taskChoice);
+                }}
+              >
+                {taskChoice === 'clustering' ? 'Start Clustering Pipeline →' : 'Continue to Configure Data →'}
+              </button>
+            </div>
           </div>
         ) : (
           <>
@@ -255,6 +295,23 @@ export default function StepSelectDataset({
               </p>
             </div>
 
+            <div className="aw-upload-alt">
+              <span className="aw-upload-alt-label">or</span>
+              <button
+                type="button"
+                className="aw-btn aw-btn--secondary aw-btn--full"
+                onClick={() => setLibraryOpen(true)}
+              >
+                Browse module data library (Azure)
+              </button>
+              <p className="aw-upload-alt-hint">
+                Lists the same virtual folders you see in the Azure portal for container{' '}
+                <code>aikosh-v2</code> (e.g. <code>anonymization</code>, <code>feature eng</code>,{' '}
+                <code>automl</code> — new folders appear automatically). Optional: set{' '}
+                <code>AZURE_BLOB_DATA_LIBRARY_CONTAINER_PREFIX</code> in the API <code>.env</code> to scope to a subpath.
+              </p>
+            </div>
+
             {catalogOpen && (
               <div
                 className="aw-catalog-modal-backdrop"
@@ -290,6 +347,110 @@ export default function StepSelectDataset({
                       }
                     }}
                   />
+                </div>
+              </div>
+            )}
+
+            {libraryOpen && (
+              <div
+                className="aw-catalog-modal-backdrop"
+                role="presentation"
+                onClick={() => setLibraryOpen(false)}
+              >
+                <div
+                  className="aw-catalog-modal"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-label="Module data library"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <button
+                    type="button"
+                    className="aw-catalog-modal-close"
+                    aria-label="Close"
+                    onClick={() => setLibraryOpen(false)}
+                  >
+                    ✕
+                  </button>
+                  <h3 className="aw-library-modal-title">Module data library</h3>
+                  {libraryLoading && <p className="aw-dataset-insight-loading">Loading folders…</p>}
+                  {libraryError && <p className="aw-insight-block-body" style={{ color: '#f87171' }}>{libraryError}</p>}
+                  {!libraryLoading && libraryIndex && libraryIndex.folders.length === 0 && (
+                    <p className="aw-upload-alt-hint">
+                      No CSV-like files found at this scope. For local dev, add files under{' '}
+                      <code>DATA_LIBRARY_LOCAL_ROOT</code> or set <code>DATA_LIBRARY_LOCAL_DIR</code>.
+                    </p>
+                  )}
+                  {!libraryLoading && libraryIndex && libraryIndex.folders.length > 0 && (
+                    <div className="aw-library-tree">
+                      <p className="aw-upload-alt-hint" style={{ marginTop: 0 }}>
+                        Source: {libraryIndex.source} — pick a file to import for AutoML.
+                      </p>
+                      {[...libraryIndex.folders]
+                        .sort((a, b) => {
+                          if (a.folder === DATA_LIBRARY_ROOT_FOLDER) return 1;
+                          if (b.folder === DATA_LIBRARY_ROOT_FOLDER) return -1;
+                          return a.folder.localeCompare(b.folder, undefined, { sensitivity: 'base' });
+                        })
+                        .map((f) => (
+                        <div key={f.folder} className="aw-library-folder">
+                          <button
+                            type="button"
+                            className="aw-library-folder-toggle"
+                            onClick={() => setLibraryExpanded((e) => (e === f.folder ? null : f.folder))}
+                          >
+                            {libraryExpanded === f.folder ? '▾' : '▸'} {dataLibraryFolderLabel(f.folder)}
+                          </button>
+                          {libraryExpanded === f.folder && (
+                            <ul className="aw-library-file-list">
+                              {f.files.map((file) => (
+                                <li key={file.name}>
+                                  <button
+                                    type="button"
+                                    className="aw-library-file-btn"
+                                    disabled={libraryImporting}
+                                    onClick={async () => {
+                                      setLibraryImporting(true);
+                                      try {
+                                        const r = await api.importDataLibrary(f.folder, file.name);
+                                        if (!r.accepted) {
+                                          window.alert(
+                                            r.message ||
+                                              'This dataset is not supported in AutoML. Pick another file from the library.',
+                                          );
+                                          return;
+                                        }
+                                        if (!r.dataset) return;
+                                        setDatasets((prev) => {
+                                          const fil = prev.filter((d) => d.filename !== r.dataset!.filename);
+                                          return [...fil, r.dataset!];
+                                        });
+                                        setLibraryOpen(false);
+                                        if (onCatalogImportComplete) {
+                                          await onCatalogImportComplete(r.dataset);
+                                        } else {
+                                          onSelect(r.dataset);
+                                        }
+                                      } catch {
+                                        window.alert('Import failed. Try again or pick another file.');
+                                      } finally {
+                                        setLibraryImporting(false);
+                                      }
+                                    }}
+                                  >
+                                    {file.name}
+                                    <span className="aw-library-file-meta">
+                                      {file.size_bytes > 0 ? ` · ${(file.size_bytes / 1024).toFixed(1)} KB` : ''}
+                                    </span>
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             )}

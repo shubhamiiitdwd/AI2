@@ -1,14 +1,38 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useSyncExternalStore } from 'react';
 import './Dashboard.css';
 import { getTrainingHistory } from './tools/automl-wizard/api';
 import type { TrainingRunSummary } from './tools/automl-wizard/types';
+import {
+  readModelExchangeSession,
+  clearModelExchangeSession,
+  getSessionActivityLabel,
+  formatSessionTime,
+  formatSessionRelative,
+  type PersistedModelExchangeSession,
+} from './modelExchangeSession';
 
 /** Inclusive lower bound for dashboard stats & recent activity (YYYY-MM-DD). */
 const STATS_FROM_YMD = import.meta.env.VITE_STATS_HISTORY_FROM_DATE || '2026-04-15';
 
+function subscribeModelExchangeSession(onStoreChange: () => void) {
+  const h = () => onStoreChange();
+  window.addEventListener('aikosh-mx-session', h);
+  const id = window.setInterval(h, 10000);
+  return () => {
+    window.removeEventListener('aikosh-mx-session', h);
+    window.clearInterval(id);
+  };
+}
+
+function getSessionSnapshot(): PersistedModelExchangeSession | null {
+  return readModelExchangeSession();
+}
+
+
 interface Props {
   onStartProject: () => void;
   onOpenRunResults?: (run: TrainingRunSummary) => void;
+  onResumeSession?: () => void;
 }
 
 function ymdFromCreatedAt(createdAt: string): string {
@@ -60,7 +84,12 @@ function isClusteringRun(run: TrainingRunSummary): boolean {
   return run.run_type === 'clustering' || run.ml_task === 'clustering';
 }
 
-export default function Dashboard({ onStartProject, onOpenRunResults }: Props) {
+export default function Dashboard({ onStartProject, onOpenRunResults, onResumeSession }: Props) {
+  const session = useSyncExternalStore(
+    subscribeModelExchangeSession,
+    getSessionSnapshot,
+    getSessionSnapshot,
+  );
   const [stats, setStats] = useState({
     models: 0,
     sessions: 0,
@@ -191,7 +220,7 @@ export default function Dashboard({ onStartProject, onOpenRunResults }: Props) {
         </div>
       </section>
 
-      <section className="mx-panels">
+      <section className="mx-panels mx-panels--triple" aria-label="Model Exchange overview">
         <div className="mx-panel mx-panel--activity">
           <div className="mx-panel-header">
             <h3><span className="mx-panel-icon">⚡</span> Recent Activity</h3>
@@ -199,11 +228,12 @@ export default function Dashboard({ onStartProject, onOpenRunResults }: Props) {
           </div>
           <div className="mx-activity-list">
             {recentRuns.map((run) => {
-              const title = run.dataset_name?.trim() || `Run ${run.run_id.slice(0, 8)}`;
+              const runKey = (run.run_id && String(run.run_id)) || 'unknown';
+              const title = run.dataset_name?.trim() || `Run ${runKey.slice(0, 8)}`;
               const tags = activityTags(run);
               const cl = isClusteringRun(run);
               return (
-                <div key={run.run_id} className="mx-activity-item">
+                <div key={runKey} className="mx-activity-item">
                   <div className="mx-activity-info">
                     <span className="mx-activity-title">{title}</span>
                     <span
@@ -225,7 +255,7 @@ export default function Dashboard({ onStartProject, onOpenRunResults }: Props) {
                     View →
                   </button>
                   <div className="mx-activity-meta">
-                    <span>⏱ {formatRelativeTime(run.created_at) || '—'}</span>
+                    <span>⏱ {formatRelativeTime((run.created_at || '').replace(' ', 'T')) || '—'}</span>
                     <div className="mx-activity-tags">
                       {tags.map((t) => (
                         <span key={t} className="mx-activity-tag">{t}</span>
@@ -239,6 +269,56 @@ export default function Dashboard({ onStartProject, onOpenRunResults }: Props) {
               <div className="mx-activity-empty">No recent activity in this period. Start a new project!</div>
             )}
           </div>
+        </div>
+
+        <div className="mx-panel mx-panel--session">
+          <div className="mx-panel-header">
+            <h3><span className="mx-panel-icon">◆</span> Session management</h3>
+            <p>Resume the AutoML or clustering workflow where you left off</p>
+          </div>
+          {session ? (
+            <div className="mx-session-card">
+              <div className="mx-session-activity">
+                {getSessionActivityLabel({
+                  step: session.step,
+                  mlTask: session.mlTask,
+                  activity: session.activity,
+                  dataset: session.dataset,
+                })}
+              </div>
+              <div className="mx-session-time">
+                <span className="mx-session-time-label">Last saved</span>
+                <time dateTime={session.at} title={formatSessionTime(session.at)}>
+                  {formatSessionRelative(session.at)} · {formatSessionTime(session.at)}
+                </time>
+              </div>
+              <div className="mx-session-actions">
+                <button
+                  type="button"
+                  className="mx-session-btn mx-session-btn--primary"
+                  onClick={() => onResumeSession?.()}
+                  disabled={!onResumeSession}
+                >
+                  Resume
+                </button>
+                <button
+                  type="button"
+                  className="mx-session-btn"
+                  onClick={() => {
+                    clearModelExchangeSession();
+                    window.dispatchEvent(new Event('aikosh-mx-session'));
+                  }}
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="mx-session-empty">
+              No saved in-progress session. Open <strong>Start New Project</strong> to work in the wizard; your
+              place is saved automatically so you can resume here.
+            </div>
+          )}
         </div>
 
         <div className="mx-panel mx-panel--capabilities">

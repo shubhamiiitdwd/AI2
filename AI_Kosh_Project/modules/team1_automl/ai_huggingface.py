@@ -187,6 +187,7 @@ async def auto_detect_task(
     classification_targets: list[str] | None = None,
     regression_targets: list[str] | None = None,
     total_rows: int = 0,
+    host_task_hint: str | None = None,
 ) -> AutoDetectTaskResponse:
     """Rule-based task detection as fallback when Azure is not available."""
     cls_allow = set(classification_targets or [])

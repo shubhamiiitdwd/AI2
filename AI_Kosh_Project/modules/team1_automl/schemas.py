@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pydantic import BaseModel, Field
 from typing import Optional
 from .enums import MLTask, ModelType, TrainingStatus
@@ -11,6 +13,33 @@ class DatasetMetadata(BaseModel):
     size_bytes: int
     category: str = "Uploaded Dataset"
     description: str = ""
+
+
+class DataLibraryFileRef(BaseModel):
+    name: str
+    size_bytes: int = 0
+
+
+class DataLibraryFolderInfo(BaseModel):
+    folder: str
+    files: list[DataLibraryFileRef]
+
+
+class DataLibraryIndexResponse(BaseModel):
+    source: str
+    folders: list[DataLibraryFolderInfo]
+
+
+class DataLibraryImportRequest(BaseModel):
+    folder: str
+    filename: str
+
+
+class DataLibraryImportResponse(BaseModel):
+    accepted: bool
+    dataset: Optional[DatasetMetadata] = None
+    message: str = ""
+    insight: Optional[DatasetWorkflowInsightResponse] = None
 
 
 class ColumnInfo(BaseModel):

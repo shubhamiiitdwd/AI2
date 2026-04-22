@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import type {
   ColumnInfo, DatasetMetadata, AIRecommendResponse, DatasetPreviewResponse, UseCaseSuggestion, MLTask, AutoDetectTaskResponse,
   ClusteringStartRequest,
@@ -30,6 +30,7 @@ export default function StepConfigureData({
   onTargetChange, onFeaturesChange, onTaskSuggest, onContinue,
   onClusteringDetected, onBack, backLabel, clusteringMode = false, onClusteringStart,
 }: Props) {
+  const suggestRequestGen = useRef(0);
   const [activeTab, setActiveTab] = useState<'config' | 'preview'>('config');
   /** Clustering: default tab shows only algorithm & search; features are on a separate tab. */
   const [clusteringPanel, setClusteringPanel] = useState<'algorithm' | 'features'>('algorithm');
@@ -53,15 +54,25 @@ export default function StepConfigureData({
 
   useEffect(() => {
     if (clusteringMode) return;
+    const myGen = ++suggestRequestGen.current;
     setSuggestionsLoading(true);
-    api.suggestUseCases(datasetId)
-      .then((res) => setSuggestions(res.suggestions))
+    api
+      .suggestUseCases(datasetId)
+      .then((res) => {
+        if (suggestRequestGen.current !== myGen) return;
+        setSuggestions(res.suggestions);
+      })
       .catch(() => {})
-      .finally(() => setSuggestionsLoading(false));
+      .finally(() => {
+        if (suggestRequestGen.current === myGen) {
+          setSuggestionsLoading(false);
+        }
+      });
   }, [datasetId, clusteringMode]);
 
   const handleAutoDetect = async () => {
     setDetecting(true);
+    suggestRequestGen.current += 1;
     try {
       const result = await api.autoDetectTask(datasetId);
       setDetectResult(result);

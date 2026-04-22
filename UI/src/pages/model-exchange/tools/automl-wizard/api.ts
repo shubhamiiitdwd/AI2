@@ -11,6 +11,8 @@ import type {
   DatasetWorkflowInsightResponse,
   ClusteringLabeledPreviewResponse,
   TextInsightResponse,
+  DataLibraryIndexResponse,
+  DataLibraryImportResponse,
 } from './types';
 
 const DEFAULT_BACKEND_PORT = '8099';
@@ -53,6 +55,16 @@ export const getDatasetWorkflowInsight = async (id: string): Promise<DatasetWork
 
 export const deleteDataset = async (id: string): Promise<void> => {
   await api.delete(`/team1/datasets/${id}`);
+};
+
+export const listDataLibrary = async (): Promise<DataLibraryIndexResponse> => {
+  const { data } = await api.get('/team1/datasets/data-library');
+  return data;
+};
+
+export const importDataLibrary = async (folder: string, filename: string): Promise<DataLibraryImportResponse> => {
+  const { data } = await api.post('/team1/datasets/data-library/import', { folder, filename });
+  return data;
 };
 
 export const suggestUseCases = async (datasetId: string): Promise<UseCaseSuggestionsResponse> => {

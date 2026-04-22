@@ -1,7 +1,7 @@
 import json
 import shutil
 from pathlib import Path
-from .config import RAW_UPLOADS_DIR, MODELS_DIR, PROCESSED_DATA_DIR
+from .config import RAW_UPLOADS_DIR, MODELS_DIR, PROCESSED_DATA_DIR, DATA_LIBRARY_LOCAL_ROOT
 
 
 class LocalStorage:
@@ -101,6 +101,50 @@ class LocalStorage:
                 if d.is_dir() and (d / "training_result.json").exists():
                     results.append(d.name)
         return results
+
+    def list_data_library(self) -> list[dict]:
+        """Match Azure: subfolders = categories; files directly in DATA_LIBRARY_LOCAL_ROOT → folder __root__."""
+        _ROOT = "__root__"
+        result: list[dict] = []
+        if not DATA_LIBRARY_LOCAL_ROOT.exists():
+            return result
+        base = DATA_LIBRARY_LOCAL_ROOT.resolve()
+        root_files: list[dict] = []
+        for f in sorted(base.iterdir(), key=lambda p: p.name.lower()):
+            if f.is_file() and f.suffix.lower() in (".csv", ".tsv", ".txt"):
+                root_files.append({"name": f.name, "size_bytes": f.stat().st_size})
+        if root_files:
+            result.append({"folder": _ROOT, "files": root_files})
+        for sub in sorted([p for p in base.iterdir() if p.is_dir()], key=lambda p: p.name.lower()):
+            files: list[dict] = []
+            for f in sorted(sub.rglob("*"), key=lambda p: str(p).lower()):
+                if not f.is_file() or f.suffix.lower() not in (".csv", ".tsv", ".txt"):
+                    continue
+                rel = f.relative_to(sub)
+                name = str(rel).replace("\\", "/")
+                files.append({"name": name, "size_bytes": f.stat().st_size})
+            if files:
+                result.append({"folder": sub.name, "files": files})
+        return result
+
+    def download_data_library_file(self, folder: str, file_name: str) -> bytes:
+        _ROOT = "__root__"
+        base = DATA_LIBRARY_LOCAL_ROOT.resolve()
+        safe_name = (file_name or "").strip().lstrip("/").replace("\\", "/")
+        if ".." in safe_name or not safe_name:
+            raise ValueError("Invalid file name")
+        folder_id = (folder or "").strip()
+        if folder_id == _ROOT:
+            path = (DATA_LIBRARY_LOCAL_ROOT / safe_name).resolve()
+        else:
+            path = (DATA_LIBRARY_LOCAL_ROOT / folder_id / safe_name).resolve()
+        try:
+            path.relative_to(base)
+        except ValueError:
+            raise ValueError("File not found") from None
+        if not path.is_file():
+            raise ValueError("File not found")
+        return path.read_bytes()
 
     def delete_training_result(self, run_id: str):
         """Delete persisted result from local disk."""

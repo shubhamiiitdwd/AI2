@@ -248,6 +248,41 @@
   display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0 8px;
 }
 .aw-dataset-nav-actions__btn { min-width: 160px; max-width: 280px; }
+.aw-dataset-cta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 20px;
+  align-items: stretch;
+}
+.aw-dataset-cta-row .aw-btn--primary {
+  flex: 1 1 200px;
+}
+.aw-dataset-cta-row .aw-btn--secondary {
+  flex: 0 1 180px;
+}
+.aw-dataset-cta-row--config {
+  margin-top: 16px;
+  max-width: 560px;
+}
+.aw-library-modal-title { margin: 0 0 12px; font-size: 18px; color: var(--t-primary); }
+.aw-library-tree { max-height: min(60vh, 480px); overflow: auto; text-align: left; }
+.aw-library-folder { margin-bottom: 8px; }
+.aw-library-folder-toggle {
+  width: 100%; text-align: left;
+  background: var(--aw-inset); border: 1px solid var(--border-dim);
+  color: var(--t-primary);
+  border-radius: 6px; padding: 8px 10px; font-weight: 600; cursor: pointer;
+}
+.aw-library-file-list { list-style: none; margin: 4px 0 0; padding: 0 0 0 8px; }
+.aw-library-file-btn {
+  display: block; width: 100%; text-align: left;
+  background: transparent; border: none; color: var(--brand);
+  cursor: pointer; padding: 6px 4px; font-size: 14px; border-radius: 4px;
+}
+.aw-library-file-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--brand) 12%, var(--bg-elevated)); }
+.aw-library-file-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+.aw-library-file-meta { color: var(--t-muted); font-size: 12px; }
 .aw-meta-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-top: 16px; }
 .aw-meta-card {
   background: var(--aw-inset); border-radius: 8px; padding: 16px; text-align: center;

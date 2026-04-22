@@ -1,9 +1,14 @@
-import { useState, useCallback, useMemo, useEffect } from 'react';
+import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import './AutoMLWizard.css';
 import type {
   WizardStep, DatasetMetadata, ColumnInfo, MLTask, ModelType, TrainingStartRequest, ClusteringResultResponse,
   TrainingRunSummary,
 } from './types';
+import {
+  writeModelExchangeSession,
+  readModelExchangeSession,
+  getSessionActivityLabel,
+} from '../../modelExchangeSession';
 import WizardStepper from './components/WizardStepper';
 import StepSelectDataset from './components/StepSelectDataset';
 import StepConfigureData from './components/StepConfigureData';
@@ -16,9 +21,17 @@ import * as api from './api';
 interface AutoMLWizardProps {
   initialOpenRun?: TrainingRunSummary | null;
   onInitialOpenConsumed?: () => void;
+  /** When true, one-time load of saved wizard state from localStorage (from dashboard “Resume”). */
+  restoreSessionOnMount?: boolean;
+  onSessionRestored?: () => void;
 }
 
-const AutoMLWizard = ({ initialOpenRun, onInitialOpenConsumed }: AutoMLWizardProps) => {
+const AutoMLWizard = ({
+  initialOpenRun,
+  onInitialOpenConsumed,
+  restoreSessionOnMount = false,
+  onSessionRestored,
+}: AutoMLWizardProps) => {
   const [step, setStep] = useState<WizardStep>(0);
   const [completedSteps, setCompletedSteps] = useState<number[]>([]);
 
@@ -38,6 +51,8 @@ const AutoMLWizard = ({ initialOpenRun, onInitialOpenConsumed }: AutoMLWizardPro
   const [trainingFinished, setTrainingFinished] = useState(false);
   const [clusteringResult, setClusteringResult] = useState<ClusteringResultResponse | null>(null);
   const [clusteringRunId, setClusteringRunId] = useState<string | null>(null);
+  const [sessionHydrated, setSessionHydrated] = useState(!restoreSessionOnMount);
+  const persistDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const isClustering = mlTask === 'clustering';
 
@@ -127,6 +142,105 @@ const AutoMLWizard = ({ initialOpenRun, onInitialOpenConsumed }: AutoMLWizardPro
       cancelled = true;
     };
   }, [initialOpenRun?.run_id, onInitialOpenConsumed]);
+
+  useEffect(() => {
+    if (initialOpenRun?.run_id) {
+      setSessionHydrated(true);
+      return;
+    }
+    if (!restoreSessionOnMount) {
+      setSessionHydrated(true);
+      return;
+    }
+    let cancelled = false;
+    const s = readModelExchangeSession();
+    if (!s?.dataset?.id) {
+      setSessionHydrated(true);
+      onSessionRestored?.();
+      return;
+    }
+    void (async () => {
+      try {
+        const list = await api.listDatasets();
+        const ds = list.find((d) => d.id === s.dataset!.id);
+        if (cancelled) return;
+        if (!ds) {
+          setSessionHydrated(true);
+          onSessionRestored?.();
+          return;
+        }
+        setMlTask(s.mlTask);
+        setStep(s.step as WizardStep);
+        setCompletedSteps(s.completedSteps);
+        setTargetColumn(s.targetColumn);
+        setFeatureColumns(s.featureColumns);
+        setRunId(s.runId);
+        setClusteringRunId(s.clusteringRunId);
+        setTrainingFinished(s.trainingFinished);
+        setDataset(ds);
+        const colData = await api.getDatasetColumns(ds.id);
+        if (cancelled) return;
+        setColumns(colData.columns);
+        if (s.mlTask === 'clustering' && s.step === 3 && s.clusteringRunId) {
+          try {
+            const res = await api.getClusteringResult(s.clusteringRunId);
+            if (!cancelled) setClusteringResult(res);
+          } catch {
+            /* result may be gone */
+          }
+        }
+      } catch {
+        /* ignore */
+      } finally {
+        if (!cancelled) {
+          setSessionHydrated(true);
+          onSessionRestored?.();
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [restoreSessionOnMount, initialOpenRun?.run_id, onSessionRestored]);
+
+  useEffect(() => {
+    if (!sessionHydrated) return;
+    if (persistDebounce.current) clearTimeout(persistDebounce.current);
+    persistDebounce.current = setTimeout(() => {
+      writeModelExchangeSession({
+        step,
+        completedSteps,
+        mlTask,
+        dataset: dataset ? { id: dataset.id, filename: dataset.filename } : null,
+        targetColumn,
+        featureColumns,
+        runId,
+        clusteringRunId,
+        trainingFinished,
+        activity: getSessionActivityLabel({
+          step,
+          mlTask,
+          activity: undefined,
+          dataset: dataset ? { id: dataset.id, filename: dataset.filename } : null,
+        }),
+      });
+      window.dispatchEvent(new Event('aikosh-mx-session'));
+    }, 500);
+    return () => {
+      if (persistDebounce.current) clearTimeout(persistDebounce.current);
+    };
+  }, [
+    sessionHydrated,
+    step,
+    completedSteps,
+    mlTask,
+    dataset,
+    targetColumn,
+    featureColumns,
+    runId,
+    clusteringRunId,
+    trainingFinished,
+  ]);
 
   const handleDatasetSelect = async (ds: DatasetMetadata) => {
     setDataset(ds);

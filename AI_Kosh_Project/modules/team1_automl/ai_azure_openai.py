@@ -46,7 +46,10 @@ TASK DEFINITIONS:
 - This rule OVERRIDES standard classification logic.
 
 4) CLUSTERING:
-- Use ONLY if no valid supervised target exists in the provided lists (or for exploratory grouping when appropriate).
+- Use when the question is to **find natural groups/segments** (customers, products, locations, patients, text/doc topics as tabular features, etc.) with **no** single clear column the user must **predict** as a label or quantity. Exploratory “what clusters exist?” → clustering.
+- Use when a supplied HOST HINT in the user message says to prefer clustering, or when both CLASSIFICATION and REGRESSION target lists in the user message are empty (only unsupervised is appropriate).
+- For **Mall / customer** style tables: segments from behavior/demographic **features** (e.g. income + spend + age) are clustering; do not default to classifying a weak binary demographic if the main story is **segmentation**.
+- For **any** table where the natural goal is **unsupervised** grouping, set top-level "task" to "clustering" and put a clustering suggestion first. Reserve classification/regression for a clear **prediction** use case on a vetted target column.
 - For clustering suggestions, target_hint MUST be exactly: "No target (unsupervised)"
 
 STRICT RULES:
@@ -315,6 +318,10 @@ def _coerce_top_level_task(
     task = (data.get("task") or "").lower()
     if task not in ("classification", "regression", "clustering"):
         task = ""
+    # If the model chose clustering, keep it: do not fall back to the first available classification target
+    # (e.g. Mall Customers has Gender in the classification list but the intended task is clustering).
+    if task == "clustering":
+        return "clustering"
     if task == "classification" and (not cls_set or not first_cls):
         task = ""
     elif task == "regression" and (not reg_set or not first_reg):
@@ -385,6 +392,7 @@ async def auto_detect_task(
     classification_targets: list[str] | None = None,
     regression_targets: list[str] | None = None,
     total_rows: int = 0,
+    host_task_hint: str | None = None,
 ) -> AutoDetectTaskResponse:
     """Use Azure OpenAI to determine the best ML task for a dataset (enforced post-rules)."""
     client = _get_client()
@@ -406,6 +414,11 @@ async def auto_detect_task(
         + ("\n".join(f"  - {n}" for n in reg_list) if reg_list else "  (none — avoid regression with a named target)")
     )
     rows_preview = json.dumps(sample_rows[:25], default=str)
+    hint_block = (
+        f"\n\n--- HOST HINT (high priority) ---\n{host_task_hint.strip()}\n"
+        if (host_task_hint and str(host_task_hint).strip())
+        else ""
+    )
 
     response = await client.chat.completions.create(
         model=AZURE_OPENAI_DEPLOYMENT,
@@ -431,7 +444,8 @@ async def auto_detect_task(
                 "content": (
                     f"Dataset file: {filename}\nApprox rows in file: {total_rows}\n\n"
                     f"COLUMN METADATA (up to 40 columns):\n{col_desc}\n\n{cls_block}\n\n{reg_block}\n\n"
-                    f"SAMPLE ROWS (JSON, up to 25 rows):\n{rows_preview}\n\n"
+                    f"SAMPLE ROWS (JSON, up to 25 rows):\n{rows_preview}\n"
+                    f"{hint_block}\n"
                     "Infer the best overall task (classification vs regression vs clustering) and up to "
                     f"{_MAX_AI_SUGGESTIONS} suggestions. Obey the lists strictly. JSON only."
                 ),

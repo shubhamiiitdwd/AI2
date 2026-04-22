@@ -8,6 +8,7 @@ Layout (single container, e.g. AZURE_BLOB_CONTAINER_NAME=aikosh-v2):
   {AUTOML_PREFIX}/models/{run_id}/{filename}
   {AUTOML_PREFIX}/results/training/{run_id}/result.json
   {AUTOML_PREFIX}/results/clustering/{run_id}/result.json
+  (Module data library: separate — see AZURE_BLOB_DATA_LIBRARY_CONTAINER_PREFIX, container-relative, not under AUTOML_PREFIX.)
 
 AUTOML_PREFIX defaults to "automl" (see AZURE_STORAGE_AUTOML_PREFIX).
 """
@@ -18,6 +19,7 @@ from .config import (
     AZURE_STORAGE_CONNECTION_STRING,
     AZURE_BLOB_CONTAINER_NAME,
     AZURE_STORAGE_AUTOML_PREFIX,
+    AZURE_BLOB_DATA_LIBRARY_CONTAINER_PREFIX,
     RAW_UPLOADS_DIR,
     MODELS_DIR,
     PROCESSED_DATA_DIR,
@@ -304,3 +306,94 @@ class AzureStorage:
             target = base_dir / run_id
             if target.exists():
                 shutil.rmtree(target)
+
+    # ── Module data library (container root or AZURE_BLOB_DATA_LIBRARY_CONTAINER_PREFIX) ─
+
+    @staticmethod
+    def _data_library_list_prefix() -> str:
+        """List prefix under the container (not under automl). Empty = container root."""
+        base = (AZURE_BLOB_DATA_LIBRARY_CONTAINER_PREFIX or "").strip().strip("/")
+        return f"{base}/" if base else ""
+
+    @staticmethod
+    def _data_library_root_folder_id() -> str:
+        """Group blobs with no '/' in name (at prefix root) for download API."""
+        return "__root__"
+
+    def list_data_library(self) -> list[dict]:
+        """
+        List blobs under the container, grouped by the first path segment (portal "folders"),
+        e.g. anonymization/..., feature eng/..., automl/... Loose blobs at the prefix root use folder __root__.
+        """
+        from collections import defaultdict
+
+        out: dict[str, list[dict]] = defaultdict(list)
+        list_prefix = self._data_library_list_prefix()
+        try:
+            blob_service = _get_blob_service()
+            container_client = blob_service.get_container_client(AZURE_BLOB_CONTAINER_NAME)
+            if list_prefix:
+                blobs = container_client.list_blobs(name_starts_with=list_prefix)
+            else:
+                blobs = container_client.list_blobs()
+            root_id = self._data_library_root_folder_id()
+            for blob in blobs:
+                rel = blob.name[len(list_prefix) :] if list_prefix else blob.name
+                if not rel or rel.endswith("/") or ".." in rel:
+                    continue
+                # Do not list internal Team1 training blobs (automl/datasets|models|results/...).
+                if not list_prefix and rel.startswith("automl/"):
+                    p2 = rel.split("/")
+                    if len(p2) >= 2 and p2[0] == "automl" and p2[1] in ("datasets", "models", "results"):
+                        continue
+                parts = rel.split("/")
+                if len(parts) == 1:
+                    folder = root_id
+                    file_rel = parts[0]
+                else:
+                    folder = parts[0]
+                    file_rel = "/".join(parts[1:])
+                if not folder or not file_rel or ".." in file_rel:
+                    continue
+                try:
+                    sz = int(getattr(blob, "size", 0) or 0)
+                except (TypeError, ValueError):
+                    sz = 0
+                out[folder].append({"name": file_rel, "size_bytes": sz})
+        except Exception as e:
+            logger.warning("list_data_library Azure: %s", e)
+            return []
+
+        result: list[dict] = []
+        for folder in sorted(out.keys(), key=str.lower):
+            by_name: dict[str, int] = {}
+            for f in out[folder]:
+                n = f.get("name") or ""
+                if not n:
+                    continue
+                by_name[n] = max(by_name.get(n, 0), int(f.get("size_bytes") or 0))
+            file_list = [{"name": n, "size_bytes": s} for n, s in sorted(by_name.items(), key=lambda x: x[0].lower())]
+            if file_list:
+                result.append({"folder": folder, "files": file_list})
+        return result
+
+    def download_data_library_file(self, folder: str, file_name: str) -> bytes:
+        """Blob path: {list_prefix} or {list_prefix}{folder}/ for nested files; __root__ = only filename under list_prefix."""
+        list_prefix = self._data_library_list_prefix()
+        root_id = self._data_library_root_folder_id()
+        safe_folder = (folder or "").strip().strip("/").replace("\\", "/")
+        safe_name = (file_name or "").strip().lstrip("/").replace("\\", "/")
+        if ".." in safe_name or (safe_folder and ".." in safe_folder):
+            raise ValueError("Invalid folder or file name")
+        if not safe_name:
+            raise ValueError("Invalid file name")
+        if not safe_folder:
+            raise ValueError("Invalid folder id")
+
+        if safe_folder == root_id:
+            blob_name = f"{list_prefix}{safe_name}" if list_prefix else safe_name
+        else:
+            blob_name = f"{list_prefix}{safe_folder}/{safe_name}" if list_prefix else f"{safe_folder}/{safe_name}"
+        blob_service = _get_blob_service()
+        blob_client = blob_service.get_blob_client(AZURE_BLOB_CONTAINER_NAME, blob_name)
+        return blob_client.download_blob().readall()

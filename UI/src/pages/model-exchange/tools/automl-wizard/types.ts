@@ -8,6 +8,28 @@ export interface DatasetMetadata {
   description: string;
 }
 
+/** Shared module datasets (Azure blob or local DATA_LIBRARY). */
+export interface DataLibraryFileRef {
+  name: string;
+  size_bytes: number;
+}
+
+export interface DataLibraryFolderInfo {
+  folder: string;
+  files: DataLibraryFileRef[];
+}
+
+export interface DataLibraryIndexResponse {
+  source: string;
+  folders: DataLibraryFolderInfo[];
+}
+
+export interface DataLibraryImportResponse {
+  accepted: boolean;
+  dataset?: DatasetMetadata;
+  message: string;
+}
+
 export interface ColumnInfo {
   name: string;
   dtype: string;
