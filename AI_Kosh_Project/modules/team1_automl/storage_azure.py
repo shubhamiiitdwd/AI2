@@ -1,7 +1,13 @@
 """
 Azure Blob Storage implementation.
 Activated when AZURE_STORAGE_CONNECTION_STRING is set, or when
-AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY are set (connection string is built the same way as the Azure portal / CLI).
+AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY are set.
+
+Client creation matches the same pattern as an account-key integration:
+- If the env has a full connection string → BlobServiceClient.from_connection_string
+- If only name + key are set (no full string in env) →
+  BlobServiceClient(account_url=f"https://{account}.blob.{suffix}", credential=key)
+  (avoids some edge cases with synthesized connection strings and matches Azure portal "Access keys" usage.)
 
 Layout (single container, e.g. AZURE_BLOB_CONTAINER_NAME=aikosh-v2):
   {AUTOML_PREFIX}/datasets/{dataset_id}/{filename}
@@ -14,6 +20,7 @@ AUTOML_PREFIX defaults to "automl" (see AZURE_STORAGE_AUTOML_PREFIX).
 """
 import json
 import logging
+import os
 from pathlib import Path
 from .config import (
     AZURE_STORAGE_CONNECTION_STRING,
@@ -44,13 +51,33 @@ def _blob_path(*segments: str) -> str:
 
 
 def _get_blob_service():
+    """Single BlobServiceClient for the storage account, aligned with account URL + key when name/key are in .env."""
     global _blob_service
     if _blob_service is None:
         try:
             from azure.core.exceptions import ResourceExistsError
             from azure.storage.blob import BlobServiceClient
 
-            _blob_service = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+            raw_conn = (os.getenv("AZURE_STORAGE_CONNECTION_STRING") or "").strip()
+            account_name = (os.getenv("AZURE_STORAGE_ACCOUNT_NAME") or "").strip()
+            account_key = (os.getenv("AZURE_STORAGE_ACCOUNT_KEY") or "").strip()
+            endpoint_suffix = (os.getenv("AZURE_STORAGE_ENDPOINT_SUFFIX") or "core.windows.net").strip()
+
+            if raw_conn:
+                _blob_service = BlobServiceClient.from_connection_string(raw_conn)
+            elif account_name and account_key:
+                # Same as: https://<account>.blob.core.windows.net + credential=account_key
+                account_url = f"https://{account_name}.blob.{endpoint_suffix}"
+                _blob_service = BlobServiceClient(account_url=account_url, credential=account_key)
+            else:
+                # Legacy fallback: config may have synthesized a connection string at import time.
+                if not (AZURE_STORAGE_CONNECTION_STRING or "").strip():
+                    raise ValueError(
+                        "Azure storage not configured: set AZURE_STORAGE_CONNECTION_STRING, "
+                        "or set AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY in .env"
+                    )
+                _blob_service = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+
             container = _blob_service.get_container_client(AZURE_BLOB_CONTAINER_NAME)
             try:
                 container.create_container()
@@ -361,8 +388,9 @@ class AzureStorage:
                     sz = 0
                 out[folder].append({"name": file_rel, "size_bytes": sz})
         except Exception as e:
+            # Do not swallow: callers must surface auth/container errors to the client.
             logger.warning("list_data_library Azure: %s", e)
-            return []
+            raise
 
         result: list[dict] = []
         for folder in sorted(out.keys(), key=str.lower):

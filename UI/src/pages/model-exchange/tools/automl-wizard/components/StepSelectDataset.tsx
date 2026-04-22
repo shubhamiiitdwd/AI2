@@ -60,6 +60,11 @@ export default function StepSelectDataset({
     api
       .listDataLibrary()
       .then((idx) => {
+        if (!idx || !Array.isArray(idx.folders)) {
+          setLibraryIndex({ source: 'none', folders: [] });
+          setLibraryError('Invalid response from the server when loading the data library.');
+          return;
+        }
         setLibraryIndex(idx);
         const sorted = [...idx.folders].sort((a, b) => {
           if (a.folder === DATA_LIBRARY_ROOT_FOLDER) return 1;
@@ -68,9 +73,12 @@ export default function StepSelectDataset({
         });
         if (sorted.length > 0) setLibraryExpanded(sorted[0].folder);
       })
-      .catch(() => {
+      .catch((err) => {
         setLibraryError(
-          'Could not list module datasets. Check storage connection and AZURE_BLOB_DATA_LIBRARY_CONTAINER_PREFIX in the API .env.',
+          api.formatTeam1AxiosError(
+            err,
+            'Could not list module datasets. Check the API .env (Azure storage) and that the backend is running.',
+          ),
         );
       })
       .finally(() => setLibraryLoading(false));
@@ -377,8 +385,20 @@ export default function StepSelectDataset({
                   {libraryError && <p className="aw-insight-block-body" style={{ color: '#f87171' }}>{libraryError}</p>}
                   {!libraryLoading && libraryIndex && libraryIndex.folders.length === 0 && (
                     <p className="aw-upload-alt-hint">
-                      No CSV-like files found at this scope. For local dev, add files under{' '}
-                      <code>DATA_LIBRARY_LOCAL_ROOT</code> or set <code>DATA_LIBRARY_LOCAL_DIR</code>.
+                      {libraryIndex.source === 'azure' ? (
+                        <>
+                          No CSV/TSV files found under this container scope. Confirm blobs exist in Azure (container{' '}
+                          <code>aikosh-v2</code> by default) and that <code>AZURE_BLOB_DATA_LIBRARY_CONTAINER_PREFIX</code>{' '}
+                          matches your layout, or add files under the chosen prefix.
+                        </>
+                      ) : (
+                        <>
+                          No CSV-like files found. The API is using <strong>local</strong> disk (no Azure connection
+                          string). Add files under <code>shared_workspace/data_library</code> or set{' '}
+                          <code>DATA_LIBRARY_LOCAL_DIR</code>, or set <code>AZURE_STORAGE_CONNECTION_STRING</code> (or
+                          account name + key) in <code>AI_Kosh_Project/.env</code> and restart the API to use Azure.
+                        </>
+                      )}
                     </p>
                   )}
                   {!libraryLoading && libraryIndex && libraryIndex.folders.length > 0 && (

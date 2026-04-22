@@ -1,4 +1,4 @@
-import axios from 'axios';
+import axios, { isAxiosError } from 'axios';
 import type {
   DatasetMetadata, DatasetColumnsResponse, DatasetPreviewResponse,
   AIRecommendResponse, TrainingStartRequest, TrainingStartResponse,
@@ -25,6 +25,31 @@ const BASE =
     ? ''
     : `http://localhost:${import.meta.env.VITE_BACKEND_PORT || DEFAULT_BACKEND_PORT}`);
 const api = axios.create({ baseURL: BASE });
+
+/** User-visible message for failed /team1 calls (FastAPI `detail` or network). */
+export function formatTeam1AxiosError(err: unknown, fallback: string): string {
+  if (!isAxiosError(err)) return fallback;
+  if (err.code === 'ERR_NETWORK' || err.message === 'Network Error') {
+    return (
+      'Cannot reach the API. Start the Team1 backend from the AI_Kosh_Project folder ' +
+      '(e.g. python -m modules.team1_automl.run_local) and keep the default port 8099 if you use npm run dev for the UI.'
+    );
+  }
+  const d = err.response?.data;
+  if (d && typeof d === 'object' && 'detail' in d) {
+    const det = (d as { detail?: unknown }).detail;
+    if (typeof det === 'string' && det.trim()) return det.trim();
+    if (Array.isArray(det)) {
+      const parts = det.map((x) => {
+        if (typeof x === 'object' && x !== null && 'msg' in x) return String((x as { msg: unknown }).msg);
+        return String(x);
+      });
+      if (parts.length) return parts.join(' ');
+    }
+  }
+  if (err.response?.status) return `${fallback} (HTTP ${err.response.status})`;
+  return fallback;
+}
 
 export const uploadDataset = async (file: File): Promise<DatasetMetadata> => {
   const form = new FormData();

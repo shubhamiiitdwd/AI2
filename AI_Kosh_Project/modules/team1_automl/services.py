@@ -290,7 +290,17 @@ def list_data_library_index() -> DataLibraryIndexResponse:
         raw: list[dict] = list_fn()  # type: ignore[assignment]
     except Exception as e:
         logger.warning("list_data_library: %s", e)
-        return DataLibraryIndexResponse(source="none", folders=[])
+        hint = (
+            "Check AI_Kosh_Project/.env: set AZURE_STORAGE_CONNECTION_STRING (or both "
+            "AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY) for Azure, "
+            "or use local module files under shared_workspace/data_library (or DATA_LIBRARY_LOCAL_DIR). "
+            "Optionally set AZURE_BLOB_CONTAINER_NAME and AZURE_BLOB_DATA_LIBRARY_CONTAINER_PREFIX. "
+            "Restart the API after changing .env."
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"{e!s}. {hint}" if f"{e!s}".strip() else hint,
+        ) from e
 
     folders: list[DataLibraryFolderInfo] = []
     for item in raw:
