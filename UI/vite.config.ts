@@ -11,7 +11,9 @@ function backendHintPlugin(port: string): Plugin {
     configureServer(server) {
       server.httpServer?.once('listening', () => {
         console.log('')
-        console.log(`\x1b[33m[AI Kosh]\x1b[0m Proxy /team1 → http://127.0.0.1:${port}`)
+        console.log(
+          `\x1b[33m[AI Kosh]\x1b[0m Proxy /team1, /api → http://127.0.0.1:${port}`,
+        )
         console.log(
           `\x1b[33m[AI Kosh]\x1b[0m \x1b[36mnpm run dev:all\x1b[0m waits for the API on port ${port} before starting Vite. Running \x1b[36mnpm run dev\x1b[0m alone needs the API already up.`,
         )
@@ -49,6 +51,11 @@ export default defineConfig(({ mode }) => {
           changeOrigin: true,
           /** Required for clustering / training WebSocket when the UI uses same-origin ws: URLs. */
           ws: true,
+        },
+        /** Team1 compatibility routes, e.g. /api/blobs/outputs, /api/blobs/download */
+        '/api': {
+          target: `http://127.0.0.1:${backendPort}`,
+          changeOrigin: true,
         },
       },
     },

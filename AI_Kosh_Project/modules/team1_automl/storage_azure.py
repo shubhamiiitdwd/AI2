@@ -94,6 +94,11 @@ def _get_blob_service():
     return _blob_service
 
 
+def get_azure_blob_service():
+    """Shared BlobServiceClient (same as AutoML) for integration routes (e.g. /api/blobs)."""
+    return _get_blob_service()
+
+
 class AzureStorage:
     # ── Dataset Operations (existing) ──────────────────────────────────────
 

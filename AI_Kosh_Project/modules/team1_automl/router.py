@@ -53,6 +53,11 @@ async def import_hf_dataset(req: HFImportRequest):
 
 
 @router.get("/datasets/data-library", response_model=DataLibraryIndexResponse)
+@router.post(
+    "/datasets/data-library",
+    response_model=DataLibraryIndexResponse,
+    summary="List module data library (POST = same as GET; fixes HTTP 405 if a client or proxy issues POST).",
+)
 def list_data_library():
     return services.list_data_library_index()
 

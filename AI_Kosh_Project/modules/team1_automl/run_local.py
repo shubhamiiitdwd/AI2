@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from modules.team1_automl.router import router
+from modules.team1_automl.blobs_integration import router as blobs_router
 from modules.team1_automl import services as team1_services
 
 
@@ -64,6 +65,7 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.include_router(blobs_router)
 
 _DEFAULT_PORT = int(os.getenv("BACKEND_PORT", "8099"))
 
