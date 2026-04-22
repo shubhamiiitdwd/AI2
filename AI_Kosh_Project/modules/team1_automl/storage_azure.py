@@ -352,6 +352,13 @@ class AzureStorage:
         """Group blobs with no '/' in name (at prefix root) for download API."""
         return "__root__"
 
+    @staticmethod
+    def _data_library_file_suffix_ok(file_rel: str) -> bool:
+        """List only tabular files we can import (same idea as local DATA_LIBRARY: csv/tsv/txt)."""
+        leaf = (file_rel or "").split("/")[-1]
+        ext = Path(leaf).suffix.lower()
+        return ext in (".csv", ".tsv", ".txt")
+
     def list_data_library(self) -> list[dict]:
         """
         List blobs under the container, grouped by the first path segment (portal "folders"),
@@ -386,6 +393,8 @@ class AzureStorage:
                     folder = parts[0]
                     file_rel = "/".join(parts[1:])
                 if not folder or not file_rel or ".." in file_rel:
+                    continue
+                if not self._data_library_file_suffix_ok(file_rel):
                     continue
                 try:
                     sz = int(getattr(blob, "size", 0) or 0)

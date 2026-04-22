@@ -17,14 +17,34 @@ import type {
 
 const DEFAULT_BACKEND_PORT = '8099';
 
-// Dev: empty baseURL → requests go to Vite; vite.config.ts proxies /team1 to FastAPI (no CORS).
-// Prod: set VITE_API_URL or fall back to localhost API (port must match VITE_BACKEND_PORT / backend).
+/**
+ * Team1 AutoML API origin (port 8099 by default). Never use VITE_API_BASE_URL here — that is often
+ * Team2 / another service (e.g. :8000). Module library must call the same host as run_local.
+ */
+function getTeam1ApiOrigin(): string {
+  const a = (import.meta.env.VITE_API_URL as string | undefined)?.trim();
+  const b = (import.meta.env.VITE_TEAM1_API_URL as string | undefined)?.trim();
+  if (a) return a.replace(/\/+$/, '');
+  if (b) return b.replace(/\/+$/, '');
+  const port = (import.meta.env.VITE_BACKEND_PORT as string | undefined) || DEFAULT_BACKEND_PORT;
+  return `http://127.0.0.1:${port}`;
+}
+
+// Default client: dev = same-origin + Vite proxy to FastAPI; prod = full API URL (or VITE_API_URL).
 const BASE =
   import.meta.env.VITE_API_URL ||
   (import.meta.env.DEV
     ? ''
     : `http://localhost:${import.meta.env.VITE_BACKEND_PORT || DEFAULT_BACKEND_PORT}`);
 const api = axios.create({ baseURL: BASE });
+
+/**
+ * Module data library (Azure) only: always call Team1 on getTeam1ApiOrigin() — same pattern as
+ * connecting WebSockets directly to the API port (avoids HTTP 405 when /team1 hits the Vite port).
+ */
+const dataLibraryApi = axios.create({
+  baseURL: getTeam1ApiOrigin(),
+});
 
 /** User-visible message for failed /team1 calls (FastAPI `detail` or network). */
 export function formatTeam1AxiosError(err: unknown, fallback: string): string {
@@ -83,12 +103,12 @@ export const deleteDataset = async (id: string): Promise<void> => {
 };
 
 export const listDataLibrary = async (): Promise<DataLibraryIndexResponse> => {
-  const { data } = await api.get('/team1/datasets/data-library');
+  const { data } = await dataLibraryApi.get('/team1/datasets/data-library');
   return data;
 };
 
 export const importDataLibrary = async (folder: string, filename: string): Promise<DataLibraryImportResponse> => {
-  const { data } = await api.post('/team1/datasets/data-library/import', { folder, filename });
+  const { data } = await dataLibraryApi.post('/team1/datasets/data-library/import', { folder, filename });
   return data;
 };
 
@@ -249,9 +269,6 @@ export const getWsUrl = (runId: string) => {
     const wsBase = BASE.replace(/^http/, 'ws');
     return `${wsBase}/team1/ws/training/${runId}`;
   }
-  // Do not send training WebSockets through the Vite dev proxy — it often logs
-  // "ws proxy error: write ECONNABORTED" when FastAPI closes the socket or uvicorn reloads.
-  // HTTP still uses the Vite proxy (same-origin). WS connects straight to the API port.
   const host = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
   const port = import.meta.env.VITE_BACKEND_PORT || DEFAULT_BACKEND_PORT;
   return `ws://${host}:${port}/team1/ws/training/${runId}`;
